@@ -1,0 +1,454 @@
+{
+  "timestamp": "2026-02-22T00:35:39.532268",
+  "display_date": "2026-02-13",
+  "is_current_day": false,
+  "source": "数据库",
+  "current": {
+    "date": "2026-02-13",
+    "first_limit": 27,
+    "continuous_limit": 5,
+    "exploded": 11,
+    "limit_down": 12,
+    "explode_rate": 25.58,
+    "market_mood": 3,
+    "market_mood_text": "正常"
+  },
+  "previous": {
+    "date": "2026-02-12",
+    "first_limit": 43,
+    "continuous_limit": 17,
+    "exploded": 19,
+    "limit_down": 13,
+    "explode_rate": 24.05,
+    "market_mood": 3,
+    "market_mood_text": "正常"
+  },
+  "change": {
+    "first_limit": -16,
+    "continuous_limit": -12,
+    "exploded": -8,
+    "limit_down": -1
+  },
+  "median": {
+    "first_limit": 41.5,
+    "continuous_limit": 10.5,
+    "exploded": 18.0,
+    "limit_down": 7.0
+  },
+  "history": [
+    {
+      "date": "2026-01-13",
+      "first_limit": 34,
+      "continuous_limit": 55,
+      "exploded": 59,
+      "limit_down": 49,
+      "explode_rate": 48.0,
+      "market_mood": 3,
+      "mood_score": -30,
+      "mood_name": "冰点"
+    },
+    {
+      "date": "2026-01-14",
+      "first_limit": 59,
+      "continuous_limit": 40,
+      "exploded": 59,
+      "limit_down": 14,
+      "explode_rate": 37.0,
+      "market_mood": 3,
+      "mood_score": -15.55,
+      "mood_name": "退潮"
+    },
+    {
+      "date": "2026-01-15",
+      "first_limit": 37,
+      "continuous_limit": 18,
+      "exploded": 18,
+      "limit_down": 63,
+      "explode_rate": 25.0,
+      "market_mood": 3,
+      "mood_score": -29.39,
+      "mood_name": "冰点"
+    },
+    {
+      "date": "2026-01-16",
+      "first_limit": 48,
+      "continuous_limit": 10,
+      "exploded": 39,
+      "limit_down": 46,
+      "explode_rate": 40.0,
+      "market_mood": 3,
+      "mood_score": -29.03,
+      "mood_name": "冰点"
+    },
+    {
+      "date": "2026-01-19",
+      "first_limit": 64,
+      "continuous_limit": 23,
+      "exploded": 20,
+      "limit_down": 23,
+      "explode_rate": 19.0,
+      "market_mood": 3,
+      "mood_score": -12.13,
+      "mood_name": "退潮"
+    },
+    {
+      "date": "2026-01-20",
+      "first_limit": 42,
+      "continuous_limit": 12,
+      "exploded": 16,
+      "limit_down": 16,
+      "explode_rate": 22.857142857142858,
+      "market_mood": 3,
+      "mood_score": 1.67,
+      "mood_name": "分化"
+    },
+    {
+      "date": "2026-01-21",
+      "first_limit": 71,
+      "continuous_limit": 8,
+      "exploded": 25,
+      "limit_down": 4,
+      "explode_rate": 24.03846153846154,
+      "market_mood": 3,
+      "mood_score": 14.9,
+      "mood_name": "爆发"
+    },
+    {
+      "date": "2026-01-22",
+      "first_limit": 56,
+      "continuous_limit": 17,
+      "exploded": 27,
+      "limit_down": 2,
+      "explode_rate": 27.0,
+      "market_mood": 3,
+      "mood_score": 12.92,
+      "mood_name": "爆发"
+    },
+    {
+      "date": "2026-01-23",
+      "first_limit": 93,
+      "continuous_limit": 11,
+      "exploded": 18,
+      "limit_down": 1,
+      "explode_rate": 14.754098360655737,
+      "market_mood": 3,
+      "mood_score": 27.45,
+      "mood_name": "高潮"
+    },
+    {
+      "date": "2026-01-26",
+      "first_limit": 55,
+      "continuous_limit": 15,
+      "exploded": 40,
+      "limit_down": 30,
+      "explode_rate": 36.36363636363637,
+      "market_mood": 3,
+      "mood_score": 2.56,
+      "mood_name": "分化"
+    },
+    {
+      "date": "2026-01-27",
+      "first_limit": 39,
+      "continuous_limit": 14,
+      "exploded": 18,
+      "limit_down": 2,
+      "explode_rate": 25.352112676056336,
+      "market_mood": 3,
+      "mood_score": 7.66,
+      "mood_name": "分化"
+    },
+    {
+      "date": "2026-01-28",
+      "first_limit": 70,
+      "continuous_limit": 10,
+      "exploded": 26,
+      "limit_down": 5,
+      "explode_rate": 24.528301886792452,
+      "market_mood": 3,
+      "mood_score": 18.9,
+      "mood_name": "爆发"
+    },
+    {
+      "date": "2026-01-29",
+      "first_limit": 63,
+      "continuous_limit": 19,
+      "exploded": 35,
+      "limit_down": 12,
+      "explode_rate": 29.914529914529915,
+      "market_mood": 3,
+      "mood_score": 12.46,
+      "mood_name": "爆发"
+    },
+    {
+      "date": "2026-01-30",
+      "first_limit": 41,
+      "continuous_limit": 7,
+      "exploded": 21,
+      "limit_down": 52,
+      "explode_rate": 30.434782608695656,
+      "market_mood": 3,
+      "mood_score": -4.22,
+      "mood_name": "分化"
+    },
+    {
+      "date": "2026-02-02",
+      "first_limit": 26,
+      "continuous_limit": 10,
+      "exploded": 18,
+      "limit_down": 98,
+      "explode_rate": 33.33333333333333,
+      "market_mood": 3,
+      "mood_score": -25.13,
+      "mood_name": "冰点"
+    },
+    {
+      "date": "2026-02-03",
+      "first_limit": 59,
+      "continuous_limit": 10,
+      "exploded": 18,
+      "limit_down": 9,
+      "explode_rate": 20.689655172413794,
+      "market_mood": 3,
+      "mood_score": 8.95,
+      "mood_name": "分化"
+    },
+    {
+      "date": "2026-02-04",
+      "first_limit": 56,
+      "continuous_limit": 12,
+      "exploded": 19,
+      "limit_down": 5,
+      "explode_rate": 21.839080459770116,
+      "market_mood": 3,
+      "mood_score": 15.59,
+      "mood_name": "爆发"
+    },
+    {
+      "date": "2026-02-05",
+      "first_limit": 34,
+      "continuous_limit": 10,
+      "exploded": 10,
+      "limit_down": 15,
+      "explode_rate": 18.51851851851852,
+      "market_mood": 3,
+      "mood_score": -1.19,
+      "mood_name": "分化"
+    },
+    {
+      "date": "2026-02-06",
+      "first_limit": 47,
+      "continuous_limit": 8,
+      "exploded": 26,
+      "limit_down": 5,
+      "explode_rate": 32.098765432098766,
+      "market_mood": 3,
+      "mood_score": 3.31,
+      "mood_name": "分化"
+    },
+    {
+      "date": "2026-02-09",
+      "first_limit": 69,
+      "continuous_limit": 14,
+      "exploded": 26,
+      "limit_down": 3,
+      "explode_rate": 23.853211009174313,
+      "market_mood": 3,
+      "mood_score": 22.3,
+      "mood_name": "爆发"
+    },
+    {
+      "date": "2026-02-10",
+      "first_limit": 39,
+      "continuous_limit": 21,
+      "exploded": 8,
+      "limit_down": 2,
+      "explode_rate": 11.76470588235294,
+      "market_mood": 3,
+      "mood_score": 13.22,
+      "mood_name": "爆发"
+    },
+    {
+      "date": "2026-02-11",
+      "first_limit": 40,
+      "continuous_limit": 11,
+      "exploded": 17,
+      "limit_down": 5,
+      "explode_rate": 25.0,
+      "market_mood": 3,
+      "mood_score": 6.24,
+      "mood_name": "分化"
+    },
+    {
+      "date": "2026-02-12",
+      "first_limit": 43,
+      "continuous_limit": 17,
+      "exploded": 19,
+      "limit_down": 13,
+      "explode_rate": 24.050632911392405,
+      "market_mood": 3,
+      "mood_score": 12.17,
+      "mood_name": "爆发"
+    },
+    {
+      "date": "2026-02-13",
+      "first_limit": 27,
+      "continuous_limit": 5,
+      "exploded": 11,
+      "limit_down": 12,
+      "explode_rate": 25.581395348837212,
+      "market_mood": 3,
+      "mood_score": -8.48,
+      "mood_name": "退潮"
+    }
+  ],
+  "analysis": "首板，数量缩减很大，因为节前最后一天，活跃资金不多，上午10.00貌似才个位数的首板，同时也没有什么方向。\n\n连扳，这么低的数据还是建立在很多反包板的情况下，实际连扳梯队很单薄，且没有题材方向。\n\n炸板，看似不高，但主要还是因为市场不活跃，正常情绪的话，炸板应该更高。\n\n跌停，光纤经过一波加速开始补跌，通鼎互联、杭电股份、特发信息都地板了；玻纤也补跌，卓郎智能地板，其他也是全绿；aigc的欢瑞世纪继续地板，德才股份补跌；光伏继续退潮，逆势的雅博股份补跌地板，昨天先行的双良节能完全没溢价，也是地板；航天的巨力索具也是连续地板，这两天出现连续地板，而且不放人，而且还是人气标亏钱效应有点大。",
+  "market_mood": {
+    "total_score": -8.48,
+    "mood_level": 2,
+    "mood_name": "退潮",
+    "indicator_scores": {
+      "all_time_high": -4.520547945205479,
+      "continuous_vs_median": -3.5,
+      "explode_rate": -0.5442480620155052,
+      "first_limit_vs_median": -5.590361445783133,
+      "limit_down_base": -1.7999999999999998,
+      "one_year_high": 0,
+      "six_month_high": 0,
+      "height_5plus": 2,
+      "height_6plus": 0.0,
+      "height_7plus": 0,
+      "ladder_completeness": 0,
+      "ladder_fullness": -1.0332750549884384,
+      "top_tier_breakthrough": 6,
+      "continuous_limit_down": -0.24,
+      "index_cooperation": 0.0,
+      "hot_topics_count": 0.0,
+      "topic_activity": 0,
+      "topic_strength": 0.75
+    },
+    "indicator_details": {
+      "all_time_high": {
+        "value": 20,
+        "median": 36.5,
+        "diff": -16.5
+      },
+      "continuous_vs_median": {
+        "value": 5,
+        "median": 10.5,
+        "diff": -5.5,
+        "ratio": 0.47619047619047616
+      },
+      "explode_rate": {
+        "value": 25.581395348837212,
+        "median_5days": 23.951921960283357,
+        "diff": 1.6294733885538548
+      },
+      "first_limit_vs_median": {
+        "value": 27,
+        "median": 41.5,
+        "diff": -14.5,
+        "ratio": 0.6506024096385542
+      },
+      "limit_down_base": {
+        "value": 12,
+        "score": -1.7999999999999998,
+        "first_num": 1,
+        "digits": 2
+      },
+      "one_year_high": {
+        "reason": "此指标已禁用，数据重复，只使用历史新高指标"
+      },
+      "six_month_high": {
+        "reason": "此指标已禁用，数据重复，只使用历史新高指标"
+      },
+      "height_5plus": {
+        "count": 1,
+        "score_per_stock": 2
+      },
+      "height_6plus": {
+        "count": 0,
+        "score_per_stock": 2.5
+      },
+      "height_7plus": {
+        "count": 0,
+        "score_per_stock": 3
+      },
+      "ladder_completeness": {
+        "base_score": 0,
+        "total_deduct": 0,
+        "final_score": 0,
+        "max_height": 5,
+        "effective_max": 3,
+        "missing_tiers": [],
+        "reason": "完整"
+      },
+      "ladder_fullness": {
+        "max_height": 5,
+        "total_score": -1.0332750549884384,
+        "tiers": {
+          "2": {
+            "count": 1,
+            "standard": 7,
+            "tier_weight": 0.39478878799842093,
+            "tier_max_score": 0.7895775759968419,
+            "diff_ratio": -0.8571428571428571,
+            "score": -0.6767807794258645
+          },
+          "3": {
+            "count": 3,
+            "standard": 5,
+            "tier_weight": 0.2763521515988946,
+            "tier_max_score": 0.5527043031977892,
+            "diff_ratio": -0.4,
+            "score": -0.22108172127911568
+          },
+          "4": {
+            "count": 0,
+            "standard": 3,
+            "tier_weight": 0.19344650611922623,
+            "tier_max_score": 0.38689301223845246,
+            "diff_ratio": 0,
+            "score": 0,
+            "note": "无数据"
+          },
+          "5": {
+            "count": 1,
+            "standard": 2,
+            "tier_weight": 0.13541255428345836,
+            "tier_max_score": 0.2708251085669167,
+            "diff_ratio": -0.5,
+            "score": -0.13541255428345836
+          }
+        }
+      },
+      "top_tier_breakthrough": {
+        "max_height": 5,
+        "breakthrough": true
+      },
+      "continuous_limit_down": {
+        "count_2day": 1,
+        "count_3day": 0,
+        "count_4day": 0,
+        "count_5day_plus": 0
+      },
+      "index_cooperation": {
+        "change_percent": 0.0,
+        "threshold": 1
+      },
+      "hot_topics_count": {
+        "count": 0,
+        "score_per_topic": 1.5,
+        "hot_topics": []
+      },
+      "topic_activity": {
+        "total": 0,
+        "topics": []
+      },
+      "topic_strength": {
+        "strongest_topic": "军工",
+        "max_strength_count": 3,
+        "normalized": 0.15
+      }
+    }
+  }
+}

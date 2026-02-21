@@ -1,0 +1,92 @@
+[
+  {
+    "code": "300017",
+    "name": "网宿科技",
+    "price": 20.45,
+    "change_percent": 9.48,
+    "amount": 128.4,
+    "sector": "综合",
+    "reason": "成交额第1名"
+  },
+  {
+    "code": "001330",
+    "name": "博纳影业",
+    "price": 13.4,
+    "change_percent": 7.46,
+    "amount": 59.3,
+    "sector": "综合",
+    "reason": "成交额第2名"
+  },
+  {
+    "code": "002340",
+    "name": "格林美",
+    "price": 9.5,
+    "change_percent": 9.95,
+    "amount": 57.5,
+    "sector": "综合",
+    "reason": "成交额第3名"
+  },
+  {
+    "code": "600549",
+    "name": "厦门钨业",
+    "price": 62.05,
+    "change_percent": 7.54,
+    "amount": 51.5,
+    "sector": "综合",
+    "reason": "成交额第4名"
+  },
+  {
+    "code": "000657",
+    "name": "中钨高新",
+    "price": 52.37,
+    "change_percent": 10.0,
+    "amount": 47.8,
+    "sector": "综合",
+    "reason": "成交额第5名"
+  },
+  {
+    "code": "002759",
+    "name": "天际股份",
+    "price": 43.96,
+    "change_percent": 7.06,
+    "amount": 41.6,
+    "sector": "综合",
+    "reason": "成交额第6名"
+  },
+  {
+    "code": "300166",
+    "name": "东方国信",
+    "price": 13.9,
+    "change_percent": 8.34,
+    "amount": 32.9,
+    "sector": "综合",
+    "reason": "成交额第7名"
+  },
+  {
+    "code": "600176",
+    "name": "中国巨石",
+    "price": 25.65,
+    "change_percent": 9.99,
+    "amount": 27.2,
+    "sector": "综合",
+    "reason": "成交额第8名"
+  },
+  {
+    "code": "603618",
+    "name": "杭电股份",
+    "price": 15.72,
+    "change_percent": 7.38,
+    "amount": 25.6,
+    "sector": "综合",
+    "reason": "成交额第9名"
+  },
+  {
+    "code": "000892",
+    "name": "欢瑞世纪",
+    "price": 9.87,
+    "change_percent": 10.03,
+    "amount": 23.5,
+    "sector": "综合",
+    "reason": "成交额第10名"
+  }
+]

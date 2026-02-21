@@ -1,0 +1,63 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 敏感配置
+.env
+.env.local
+*.key
+*.pem
+credentials.json
+
+# 数据文件
+data/*.json
+!data/.gitkeep
+data/*.db
+!data/fupan.db  # 允许提交主数据库文件（公开的大A数据）
+
+# 日志
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# 备份文件
+backup_*.html
+backup_*/

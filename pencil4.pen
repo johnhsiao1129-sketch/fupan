@@ -1,0 +1,71 @@
+{
+  "version": "2.8",
+  "children": [
+    {
+      "type": "icon_font",
+      "id": "m15PE",
+      "x": 68.64935064935065,
+      "y": 230,
+      "width": 24,
+      "height": 24,
+      "iconFontName": "activity",
+      "iconFontFamily": "lucide",
+      "fill": "#ffffff"
+    },
+    {
+      "type": "icon_font",
+      "id": "ShJ5m",
+      "x": 118.64935064935065,
+      "y": 230,
+      "width": 24,
+      "height": 24,
+      "iconFontName": "align-horizontal-distribute-center",
+      "iconFontFamily": "lucide",
+      "fill": "#ffffff"
+    },
+    {
+      "type": "icon_font",
+      "id": "Jj6y2",
+      "x": 182.64935064935065,
+      "y": 229,
+      "width": 24,
+      "height": 24,
+      "iconFontName": "award",
+      "iconFontFamily": "lucide",
+      "fill": "#ffffff"
+    },
+    {
+      "type": "icon_font",
+      "id": "zWuay",
+      "x": 245.64935064935065,
+      "y": 228,
+      "width": 24,
+      "height": 24,
+      "iconFontName": "bookmark",
+      "iconFontFamily": "lucide",
+      "fill": "#ffffff"
+    },
+    {
+      "type": "icon_font",
+      "id": "G0xUG",
+      "x": 315.64935064935065,
+      "y": 227,
+      "width": 24,
+      "height": 24,
+      "iconFontName": "chart-column-decreasing",
+      "iconFontFamily": "lucide",
+      "fill": "#ffffff"
+    },
+    {
+      "type": "icon_font",
+      "id": "Tb8zl",
+      "x": 402.64935064935065,
+      "y": 227,
+      "width": 24,
+      "height": 24,
+      "iconFontName": "chart-no-axes-column",
+      "iconFontFamily": "lucide",
+      "fill": "#ffffff"
+    }
+  ]
+}

@@ -1,0 +1,92 @@
+[
+  {
+    "code": "688816",
+    "name": "N易思",
+    "price": 88.92,
+    "change_percent": 58.93,
+    "amount": 13.2,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "301526",
+    "name": "国际复材",
+    "price": 11.8,
+    "change_percent": 20.04,
+    "amount": 17.3,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "300819",
+    "name": "聚杰微纤",
+    "price": 52.56,
+    "change_percent": 20.0,
+    "amount": 6.7,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "688035",
+    "name": "德邦科技",
+    "price": 61.82,
+    "change_percent": 19.99,
+    "amount": 10.4,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "300196",
+    "name": "长海股份",
+    "price": 20.33,
+    "change_percent": 15.77,
+    "amount": 12.0,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "300767",
+    "name": "震安科技",
+    "price": 21.2,
+    "change_percent": 13.07,
+    "amount": 5.7,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "688667",
+    "name": "菱电电控",
+    "price": 94.02,
+    "change_percent": 11.57,
+    "amount": 2.3,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "300461",
+    "name": "田中精机",
+    "price": 54.22,
+    "change_percent": 10.83,
+    "amount": 8.1,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "300849",
+    "name": "锦盛新材",
+    "price": 22.69,
+    "change_percent": 10.47,
+    "amount": 2.6,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  },
+  {
+    "code": "300369",
+    "name": "绿盟科技",
+    "price": 9.81,
+    "change_percent": 10.22,
+    "amount": 15.7,
+    "sector": "综合",
+    "reason": "涨幅居前"
+  }
+]

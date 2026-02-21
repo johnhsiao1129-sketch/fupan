@@ -1,0 +1,291 @@
+{
+  "version": "2.7",
+  "children": [
+    {
+      "type": "frame",
+      "id": "s4Hnr",
+      "x": 0,
+      "y": 447,
+      "name": "Frame",
+      "clip": true,
+      "width": 1280,
+      "height": 325,
+      "fill": "#252525ff",
+      "cornerRadius": 5,
+      "layout": "none",
+      "children": [
+        {
+          "type": "rectangle",
+          "id": "rE3of",
+          "x": 0,
+          "y": 0,
+          "fill": "#60c15e26",
+          "width": 159,
+          "height": 325,
+          "stroke": {
+            "align": "center",
+            "thickness": 1,
+            "fill": "#4b4b4b4d"
+          }
+        },
+        {
+          "type": "rectangle",
+          "id": "VXudr",
+          "x": 160.1250977326036,
+          "y": 0,
+          "fill": "#40919d26",
+          "width": 159,
+          "height": 325,
+          "stroke": {
+            "align": "center",
+            "thickness": 1,
+            "fill": "#4b4b4b4d"
+          }
+        },
+        {
+          "type": "rectangle",
+          "id": "RYdrH",
+          "x": 320.2501954652072,
+          "y": 0,
+          "fill": "#40919d26",
+          "width": 159,
+          "height": 325,
+          "stroke": {
+            "align": "center",
+            "thickness": 1,
+            "fill": "#4b4b4b4d"
+          }
+        },
+        {
+          "type": "rectangle",
+          "id": "JoJof",
+          "x": 1120.8756841282252,
+          "y": 0,
+          "fill": "#bb7a3726",
+          "width": 159,
+          "height": 325,
+          "stroke": {
+            "align": "center",
+            "thickness": 1,
+            "fill": "#4b4b4b4d"
+          }
+        },
+        {
+          "type": "rectangle",
+          "id": "VV5fW",
+          "x": 960.7505863956216,
+          "y": 0,
+          "fill": "#40919d26",
+          "width": 159,
+          "height": 325,
+          "stroke": {
+            "align": "center",
+            "thickness": 1,
+            "fill": "#4b4b4b4d"
+          }
+        },
+        {
+          "type": "rectangle",
+          "id": "fVdwC",
+          "x": 800.6254886630179,
+          "y": 0,
+          "fill": "#8e5a9c26",
+          "width": 159,
+          "height": 325,
+          "stroke": {
+            "align": "center",
+            "thickness": 1,
+            "fill": "#4b4b4b4d"
+          }
+        },
+        {
+          "type": "rectangle",
+          "id": "fEgzL",
+          "x": 640.5003909304144,
+          "y": 0,
+          "fill": "#b33c3c26",
+          "width": 159,
+          "height": 325,
+          "stroke": {
+            "align": "center",
+            "thickness": 1,
+            "fill": "#4b4b4b4d"
+          }
+        },
+        {
+          "type": "group",
+          "id": "ihEL2",
+          "x": 36,
+          "y": 205,
+          "children": [
+            {
+              "type": "rectangle",
+              "id": "7EoLK",
+              "x": 0,
+              "y": 24.23645320197045,
+              "fill": "#ffffff80",
+              "width": 88,
+              "height": 95.76354679802957
+            }
+          ]
+        },
+        {
+          "type": "group",
+          "id": "QbjUL",
+          "x": 196,
+          "y": 244,
+          "children": [
+            {
+              "type": "rectangle",
+              "id": "FcPig",
+              "x": 0,
+              "y": 16.35960591133005,
+              "fill": "#ffffff80",
+              "width": 88,
+              "height": 64.64039408866995
+            },
+            {
+              "type": "rectangle",
+              "id": "J7ohD",
+              "x": 0,
+              "y": 0,
+              "fill": "#ffffff40",
+              "width": 88,
+              "height": 16.35960591133005
+            }
+          ]
+        },
+        {
+          "type": "group",
+          "id": "Y7imx",
+          "x": 515,
+          "y": 229,
+          "children": [
+            {
+              "type": "rectangle",
+              "id": "E1KJg",
+              "x": 0,
+              "y": 19.389162561576313,
+              "fill": "#ffffff80",
+              "width": 88,
+              "height": 76.61083743842364
+            },
+            {
+              "type": "rectangle",
+              "id": "0Sckf",
+              "x": 0,
+              "y": 0,
+              "fill": "#ffffff40",
+              "width": 88,
+              "height": 19.389162561576352
+            }
+          ]
+        },
+        {
+          "type": "group",
+          "id": "E2gRN",
+          "x": 677,
+          "y": 61,
+          "children": [
+            {
+              "type": "rectangle",
+              "id": "YYkm7",
+              "x": 0,
+              "y": 53.32019704433492,
+              "fill": "#ffffff80",
+              "width": 88,
+              "height": 210.67980295566502
+            },
+            {
+              "type": "rectangle",
+              "id": "cVbFR",
+              "x": 0,
+              "y": 0,
+              "fill": "#ffffff40",
+              "width": 88,
+              "height": 53.320197044334975
+            }
+          ]
+        },
+        {
+          "type": "group",
+          "id": "2xVh9",
+          "x": 996,
+          "y": 132,
+          "children": [
+            {
+              "type": "rectangle",
+              "id": "Qm9pO",
+              "x": 0,
+              "y": 38.98029556650249,
+              "fill": "#ffffff80",
+              "width": 88,
+              "height": 154.01970443349754
+            },
+            {
+              "type": "rectangle",
+              "id": "l7X7S",
+              "x": 0,
+              "y": 0,
+              "fill": "#ffffff40",
+              "width": 88,
+              "height": 38.98029556650246
+            }
+          ]
+        },
+        {
+          "type": "group",
+          "id": "zSM5F",
+          "x": 1156,
+          "y": 257,
+          "children": [
+            {
+              "type": "rectangle",
+              "id": "RkFIW",
+              "x": 0,
+              "y": 13.733990147783288,
+              "fill": "#ffffff80",
+              "width": 88,
+              "height": 54.26600985221675
+            },
+            {
+              "type": "rectangle",
+              "id": "NoYXf",
+              "x": 0,
+              "y": 0,
+              "fill": "#ffffff40",
+              "width": 88,
+              "height": 13.733990147783251
+            }
+          ]
+        },
+        {
+          "type": "group",
+          "id": "6USBj",
+          "x": 837,
+          "y": 155,
+          "children": [
+            {
+              "type": "rectangle",
+              "id": "Wn4Dt",
+              "x": 0,
+              "y": 34.33497536945811,
+              "fill": "#ffffff80",
+              "width": 88,
+              "height": 135.66502463054186
+            },
+            {
+              "type": "rectangle",
+              "id": "eUDuz",
+              "x": 0,
+              "y": 0,
+              "fill": "#ffffff40",
+              "width": 88,
+              "height": 34.33497536945813
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

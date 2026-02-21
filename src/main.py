@@ -1,0 +1,3388 @@
+
+from fastapi import FastAPI, HTTPException, Request, Body
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+import asyncio
+import json
+import logging
+import os
+import random
+from datetime import datetime, timedelta, time
+import akshare as ak
+import pandas as pd
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from db_operations import (
+    RotationAnalysisDB,
+    get_last_trading_day,
+    get_latest_trading_date_from_db,
+    fetch_and_save_trading_days,
+    get_recent_trading_days,
+    ensure_trading_day_exists,
+    get_trading_days_between
+)
+from market_mood_calculator import MarketMoodCalculator
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="A股复盘系统",
+    description="专业A股复盘分析系统 - AkShare数据源",
+    version="2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+db = RotationAnalysisDB()
+
+@app.on_event("startup")
+async def startup_event():
+    """服务启动时执行初始化"""
+    logger.info("服务启动中...")
+
+    # 初始化人气榜数据源（新高榜单）- 包含"人气、热度"相关的数据源
+    # 关联关系：
+    # - 本代码初始化 popularity_sources 表数据
+    # - 前端显示: dashboard.html 的 rank-tabs (新高榜tab)
+    # - 前端子选项卡: renderPopularitySubTabs() 渲染数据源子选项卡
+    # - 数据获取: data_acquisition.py fetch_and_save_popularity_ranking() 获取新高榜单数据
+    # - 数据库操作: db_operations.py 的 popularity_sources 相关方法
+    # 过滤说明：只初始化"新高榜"数据源（半年新高、一年新高、历史新高）
+    for source_name in ['半年新高', '一年新高', '历史新高']:
+        try:
+            logger.info(f"创建人气榜数据源: {source_name}")
+            description = f'AkShare 新高榜单 - {source_name}'
+            now = datetime.now().isoformat()
+            conn = db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR IGNORE INTO popularity_sources (source_name, description, sort_order, is_active, created_at, updated_at)
+                VALUES (?, ?, 0, 1, ?, ?)
+            ''', (source_name, description, now, now))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"初始化人气榜数据源失败 {source_name}: {e}")
+
+    logger.info("服务启动完成")
+
+
+def get_query_trading_date() -> str:
+    """获取查询首板数据时应该使用的交易日
+
+    用途说明：
+    - 用于今日首板板块、题材轮动分析等需要开盘后查看最新数据的板块
+    - 规则：9:15（开盘时间）前查上一交易日，9:15后查当天
+
+    业务逻辑：
+    - 9:15之前：查询上一个交易日（开盘前没有新数据）
+    - 9:15及之后：如果当天是交易日，查询当天；否则查上一交易日
+
+    返回日期的用途：
+    - 查询首板数据（first_limits 表）
+    - 查询题材卡片（topic_activations 表的 activation_date）
+    - 查询首板-题材关联（first_limit_topics 表的 association_date）
+
+    Returns:
+        应该查询的交易日期字符串（格式：YYYY-MM-DD）
+    """
+    now = datetime.now()
+    current_date = now.date().strftime("%Y-%m-%d")
+    current_time = now.time()
+    
+    market_open_time = time(9, 15)
+    
+    # 从数据库获取最新交易日
+    latest_trading_date = get_latest_trading_date_from_db()
+    
+    if latest_trading_date is None:
+        # 数据库没有数据，使用最近的工作日
+        return get_last_trading_day()
+    
+    # 如果当前时间在9:15之前，应该查询上一个交易日
+    if current_time < market_open_time:
+        # 查询今天之前的最新交易日（使用 <today 而不是 <=today）
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT MAX(date)
+            FROM trading_days
+            WHERE date < ? AND is_active = 1
+        ''', (current_date,))
+        result = cursor.fetchone()
+        conn.close()
+
+        if result and result[0]:
+            return result[0]
+        return latest_trading_date
+    
+    # 如果当前时间在9:15及之后
+    # 检查数据库中最新交易日是否是今天
+    if latest_trading_date != current_date:
+        # 最新交易日不是今天，说明今天还没有交易数据
+        # 可能为非交易日或刚开盘但还没数据，返回数据库中的最新交易日
+        logger.info(f"数据库最新交易日({latest_trading_date})不是今天({current_date})，使用最新交易日")
+        return latest_trading_date
+    
+    # 最新交易日是今天，且当前时间是9:15及之后，查询今天
+    logger.info(f"查询今天的首板数据: {current_date}")
+    return current_date
+
+
+def get_display_trade_date(query_existing_data: bool = True) -> str:
+    """获取当前应该展示的交易日期（用于涨跌停统计、连板梯队、题材轮动分析等）
+
+    用途说明：
+    - 用于涨跌停统计、连板梯队等需要在收盘后数据才固定的板块
+    - 用于题材轮动分析等需要展示最近交易日信息的板块
+    - 规则：15:00（收盘时间）前查上一交易日，15:00后查当天
+
+    业务逻辑：
+    - 15:00之前或非交易日：查询数据库中的最新交易日（数据未固定）
+    - 15:00及之后且是工作日：
+      - query_existing_data=True: 如果当天数据存在，返回当天；否则返回最新有数据的交易日
+      - query_existing_data=False: 返回当天（即使没有数据），用于展示日期而非查询数据
+
+    返回日期的用途：
+    - 查询涨跌停统计（limit_stats 表的 trade_date）- query_existing_data=True
+    - 查询连板梯队数据 - query_existing_data=True
+    - 题材轮动分析（展示最近交易日）- query_existing_data=False
+    - 注意：今日首板板块不应使用此函数，应使用 get_query_trading_date()
+
+    Args:
+        query_existing_data: 是否只返回有数据的交易日（True用于查询数据，False用于展示日期）
+
+    Returns:
+        应该展示的交易日期字符串（格式：YYYY-MM-DD）
+    """
+    now = datetime.now()
+    current_date = now.date().strftime("%Y-%m-%d")
+    current_time = now.time()
+    weekday = now.weekday()
+
+    market_close_time = time(15, 0)
+
+    # 从数据库获取最新交易日
+    latest_trading_date = get_latest_trading_date_from_db()
+
+    # 如果数据库没有数据，返回最近的工作日
+    if latest_trading_date is None:
+        logger.info("数据库中没有交易日数据，返回最近工作日")
+        return get_last_trading_day()
+
+    # 如果当前时间 >= 15:00 且是工作日（周一到周五）
+    if current_time >= market_close_time and weekday < 5:
+        # 查询今天是否是交易日
+        from src.db_operations import is_trading_day
+        today_is_trading_day = is_trading_day(current_date)
+
+        if today_is_trading_day:
+            # 今天是交易日
+            if query_existing_data:
+                # 只返回有数据的日期
+                if latest_trading_date == current_date:
+                    logger.info(f"当前时间 >= 15:00，今天是交易日且有数据，展示当天: {current_date}")
+                    return current_date
+                else:
+                    logger.info(f"当前时间 >= 15:00，今天是交易日但无数据，展示最新交易日: {latest_trading_date}")
+                    return latest_trading_date
+            else:
+                # 返回今天的日期（即使没有数据）
+                logger.info(f"当前时间 >= 15:00，今天是交易日，返回当天: {current_date}")
+                return current_date
+        else:
+            # 今天不是交易日，返回最新有数据的交易日
+            logger.info(f"当前时间 >= 15:00，今天非交易日，展示最新交易日: {latest_trading_date}")
+            return latest_trading_date
+
+    # 当前时间 < 15:00 或非交易日，展示最新交易日
+    return latest_trading_date
+
+os.makedirs("static", exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# 初始化数据库
+try:
+    from data.database import init_database
+    init_database()
+    logger.info("数据库初始化成功")
+except Exception as e:
+    logger.error(f"数据库初始化失败: {e}")
+
+# 创建数据库操作实例
+db = RotationAnalysisDB()
+
+class StockDataService:
+    def __init__(self):
+        self.cache_dir = "data/cache"
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.history_data = self._load_history_data()
+        self.last_update = None
+        
+    def is_trading_time(self):
+        now = datetime.now()
+        weekday = now.weekday()
+        if weekday >= 5:
+            return False
+        
+        current_time = now.time()
+        if time(9, 30) <= current_time <= time(11, 30):
+            return True
+        if time(13, 0) <= current_time <= time(15, 0):
+            return True
+        return False
+    
+    def _load_history_data(self):
+        history_file = "data/history.json"
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list) and len(data) > 0:
+                        return data
+            except Exception as e:
+                logger.warning(f"加载历史数据失败: {e}")
+        
+        base_date = datetime.now() - timedelta(days=30)
+        history = []
+        for i in range(30):
+            date = base_date + timedelta(days=i)
+            first = random.randint(20, 50)
+            history.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "first_limit": first,
+                "continuous_limit": random.randint(10, int(first*0.6)),
+                "exploded": random.randint(3, int(first*0.25)),
+                "limit_down": random.randint(2, 20)
+            })
+        return history
+    
+    def _save_history_data(self):
+        try:
+            with open("data/history.json", 'w', encoding='utf-8') as f:
+                json.dump(self.history_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存历史数据失败: {e}")
+    
+    def _get_cached_data(self, cache_key):
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
+        if os.path.exists(cache_file):
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
+                if (datetime.now() - mtime).total_seconds() < 300:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.warning(f"读取缓存失败: {e}")
+        return None
+    
+    def _save_cached_data(self, cache_key, data):
+        try:
+            cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存缓存失败: {e}")
+    
+    def _calculate_median(self, data_list: List[int], n: int = 10) -> float:
+        if not data_list:
+            return 0
+        recent_data = data_list[-n:] if len(data_list) >= n else data_list
+        sorted_data = sorted(recent_data)
+        length = len(sorted_data)
+        if length == 0:
+            return 0
+        mid = length // 2
+        if length % 2 == 0:
+            return (sorted_data[mid-1] + sorted_data[mid]) / 2
+        return float(sorted_data[mid])
+    
+    def _get_market_mood(self, first_limit: int, median_first: float) -> str:
+        if not median_first or median_first == 0:
+            return "正常"
+        ratio = first_limit / median_first if median_first > 0 else 1
+        if ratio >= 1.5:
+            return "狂热"
+        elif ratio >= 1.2:
+            return "活跃"
+        elif ratio >= 0.8:
+            return "正常"
+        elif ratio >= 0.5:
+            return "谨慎"
+        return "低迷"
+    
+    def _get_realtime_data(self):
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is not None and len(df) > 0:
+                df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce').fillna(0)
+                df['成交额'] = pd.to_numeric(df['成交额'], errors='coerce').fillna(0)
+                df['最新价'] = pd.to_numeric(df['最新价'], errors='coerce').fillna(0)
+                df['今开'] = pd.to_numeric(df['今开'], errors='coerce').fillna(0)
+                df['昨收'] = pd.to_numeric(df['昨收'], errors='coerce').fillna(0)
+                return df
+        except Exception as e:
+            logger.warning(f"获取实时数据异常: {e}")
+        return None
+    
+    async def get_limit_stats(self, query_date: str = None) -> Dict:
+        """获取涨跌停统计数据（从数据库读取）
+
+        Args:
+            query_date: 查询日期，格式：YYYY-MM-DD，如果不提供则使用 get_display_trade_date()
+
+        Returns:
+            {
+                "display_date": "2025-01-31",          # 当前展示的数据日期
+                "is_current_day": False,               # 是否为当天（收盘后才为True）
+                "source": "数据库/实时",               # 数据来源
+                "current": {
+                    "date": "2025-01-31",
+                    "first_limit": 30,
+                    "continuous_limit": 15,
+                    "exploded": 5,
+                    "limit_down": 8,
+                    "explode_rate": 11.11,
+                    "market_mood": 4,
+                    "market_mood_text": "活跃"
+                },
+                "previous": {
+                    "date": "2025-01-30",
+                    "first_limit": 25,
+                    ...
+                },
+                "change": {...},
+                "median": {...},
+                "analysis": "...",
+                "history": [...]
+            }
+        """
+        try:
+            from data.database import MARKET_MOOD_MAP
+
+            # 确定查询日期
+            if query_date:
+                # 如果用户指定了查询日期，直接使用
+                display_date = query_date
+            else:
+                # 否则根据当前时间和交易日规则计算查询日期
+                now = datetime.now()
+                current_date = now.date().strftime("%Y-%m-%d")
+                current_time = now.time()
+                market_close_time = time(15, 0)
+
+                # 检查今天是否是交易日
+                conn = db._get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT date FROM trading_days
+                    WHERE date = ? AND is_active = 1
+                ''', (current_date,))
+                is_trading_day = cursor.fetchone() is not None
+                conn.close()
+
+                if is_trading_day:
+                    # 今天是交易日
+                    if current_time >= market_close_time:
+                        # 15:00之后，查询今天
+                        display_date = current_date
+                    else:
+                        # 15:00之前，查询上一个交易日
+                        display_date = db.get_previous_trading_day(current_date)
+                else:
+                    # 今天不是交易日，查询上一个交易日
+                    display_date = db.get_previous_trading_day(current_date)
+
+            # 从 trading_days 表获取24个交易日列表（从旧到新）
+            trading_days_list = db.get_trading_days_backwards_from_date(display_date, 24)
+
+            if not trading_days_list:
+                logger.warning(f"无法获取交易日列表")
+                return await self._get_fallback_limit_stats_db_mode()
+
+            # 初始化市场情绪计算器（用于计算历史数据）
+            calculator = None
+            try:
+                db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "fupan.db")
+                if os.path.exists(db_path):
+                    calculator = MarketMoodCalculator(db_path)
+            except Exception as e:
+                logger.warning(f"初始化市场情绪计算器失败: {e}")
+
+            # 构建历史数据：对每个交易日查询数据，没有数据的日期填充null
+            history = []
+            for date in trading_days_list:
+                stats = db.get_limit_stats_by_date(date)
+                if stats:
+                    # 计算新情绪系统分数
+                    mood_score = None
+                    mood_name = None
+                    if calculator:
+                        try:
+                            mood_result = calculator.calculate_market_mood(date)
+                            if mood_result['success']:
+                                mood_score = mood_result['total_score']
+                                mood_name = mood_result['mood_name']
+                                # 图表显示时应用下限，避免极端数值影响可视化
+                                mood_score = max(mood_score, -30)
+                        except Exception as e:
+                            logger.warning(f"计算{date}情绪分数失败: {e}")
+
+                    history.append({
+                        'date': stats['trade_date'],
+                        'first_limit': stats['first_limit'],
+                        'continuous_limit': stats['continuous_limit'],
+                        'exploded': stats['exploded'],
+                        'limit_down': stats['limit_down'],
+                        'explode_rate': stats['explode_rate'],
+                        'market_mood': stats['market_mood'],
+                        'mood_score': mood_score,
+                        'mood_name': mood_name
+                    })
+                else:
+                    # 没有数据的日期，填充null值
+                    history.append({
+                        'date': date,
+                        'first_limit': None,
+                        'continuous_limit': None,
+                        'exploded': None,
+                        'limit_down': None,
+                        'explode_rate': None,
+                        'market_mood': None,
+                        'mood_score': None,
+                        'mood_name': None
+                    })
+
+            # 关闭计算器
+            if calculator:
+                calculator.close()
+
+            # 当前日期的数据（用于显示在首板、炸板、跌停处）
+            current_stats = db.get_limit_stats_by_date(display_date)
+
+            # 构建current数据: 如果有数据就使用实际数据，没有数据就显示null的占位符
+            if current_stats:
+                current_data = {
+                    "date": current_stats['trade_date'],
+                    "first_limit": current_stats['first_limit'],
+                    "continuous_limit": current_stats['continuous_limit'],
+                    "exploded": current_stats['exploded'],
+                    "limit_down": current_stats['limit_down'],
+                    "explode_rate": round(current_stats['explode_rate'], 2),
+                    "market_mood": current_stats['market_mood'],
+                    "market_mood_text": current_stats['market_mood_text']
+                }
+
+                # 计算前一个交易日的数据
+                previous_stats = db.get_previous_limit_stats(display_date)
+
+                if previous_stats:
+                    change_data = {
+                        "first_limit": current_stats['first_limit'] - previous_stats['first_limit'],
+                        "continuous_limit": current_stats['continuous_limit'] - previous_stats['continuous_limit'],
+                        "exploded": current_stats['exploded'] - previous_stats['exploded'],
+                        "limit_down": current_stats['limit_down'] - previous_stats['limit_down']
+                    }
+                else:
+                    change_data = {
+                        "first_limit": 0,
+                        "continuous_limit": 0,
+                        "exploded": 0,
+                        "limit_down": 0
+                    }
+
+                previous_data = {
+                    "date": previous_stats['trade_date'] if previous_stats else display_date,
+                    "first_limit": previous_stats['first_limit'] if previous_stats else 0,
+                    "continuous_limit": previous_stats['continuous_limit'] if previous_stats else 0,
+                    "exploded": previous_stats['exploded'] if previous_stats else 0,
+                    "limit_down": previous_stats['limit_down'] if previous_stats else 0,
+                    "explode_rate": round(previous_stats['explode_rate'], 2) if previous_stats else 0,
+                    "market_mood": previous_stats['market_mood'] if previous_stats else 3,
+                    "market_mood_text": previous_stats['market_mood_text'] if previous_stats else "正常"
+                } if previous_stats else None
+            else:
+                current_data = {
+                    "date": display_date,
+                    "first_limit": None,
+                    "continuous_limit": None,
+                    "exploded": None,
+                    "limit_down": None,
+                    "explode_rate": None,
+                    "market_mood": None,
+                    "market_mood_text": "无数据"
+                }
+                change_data = {
+                    "first_limit": 0,
+                    "continuous_limit": 0,
+                    "exploded": 0,
+                    "limit_down": 0
+                }
+                previous_data = None
+
+            # 计算中位数
+            median_data = {
+                "first_limit": db.calculate_limit_stats_median('first_limit', 10),
+                "continuous_limit": db.calculate_limit_stats_median('continuous_limit', 10),
+                "exploded": db.calculate_limit_stats_median('exploded', 10),
+                "limit_down": db.calculate_limit_stats_median('limit_down', 10)
+            }
+
+            # 获取分析文本
+            analysis_data = db.get_limit_analysis(display_date)
+            analysis_text = analysis_data['analysis'] if analysis_data else ""
+
+            # 计算新的市场情绪（使用 MarketMoodCalculator）
+            market_mood_result = None
+            try:
+                db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "fupan.db")
+                if os.path.exists(db_path):
+                    calculator = MarketMoodCalculator(db_path)
+                    calculator_result = calculator.calculate_market_mood(display_date)
+                    if calculator_result['success']:
+                        market_mood_result = {
+                            'total_score': calculator_result['total_score'],
+                            'mood_level': calculator_result['mood_level'],
+                            'mood_name': calculator_result['mood_name'],
+                            'indicator_scores': calculator_result.get('indicator_scores', {}),
+                            'indicator_details': calculator_result.get('indicator_details', {})
+                        }
+                    calculator.close()
+            except Exception as e:
+                logger.warning(f"计算市场情绪失败: {e}")
+                market_mood_result = None
+
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            is_current_day = (display_date == current_date)
+            now = datetime.now()
+            source = "数据库"
+            if is_current_day and now.time() >= time(15, 0):
+                source = "实时（已收盘）"
+
+            result = {
+                "timestamp": datetime.now().isoformat(),
+                "display_date": display_date,
+                "is_current_day": is_current_day,
+                "source": source,
+                "current": current_data,
+                "previous": previous_data,
+                "change": change_data,
+                "median": {
+                    "first_limit": round(median_data['first_limit'], 1),
+                    "continuous_limit": round(median_data['continuous_limit'], 1),
+                    "exploded": round(median_data['exploded'], 1),
+                    "limit_down": round(median_data['limit_down'], 1)
+                },
+                "history": history,
+                "analysis": analysis_text,
+                "market_mood": market_mood_result
+            }
+
+            self._save_cached_data("limit_stats", result)
+            return result
+
+        except Exception as e:
+            logger.error(f"获取涨跌停数据失败: {e}", exc_info=True)
+            return await self._get_fallback_limit_stats_db_mode()
+    
+    async def _get_fallback_limit_stats_db_mode(self) -> Dict:
+        """备用数据返回（数据库模式的新结构）"""
+        from data.database import MARKET_MOOD_MAP
+
+        display_date = get_last_trading_day()
+
+        today_first = random.randint(22, 48)
+        today_continuous = random.randint(8, int(today_first*0.65))
+        today_exploded = random.randint(4, int(today_first*0.28))
+        today_limit_down = random.randint(3, 18)
+
+        total_for_rate = today_exploded + today_first + today_continuous
+        explode_rate = (today_exploded / total_for_rate * 100) if total_for_rate > 0 else 0
+        market_mood_value = random.randint(1, 5)
+
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "display_date": display_date,
+            "is_current_day": False,
+            "source": "备用数据",
+            "current": {
+                "date": display_date,
+                "first_limit": today_first,
+                "continuous_limit": today_continuous,
+                "exploded": today_exploded,
+                "limit_down": today_limit_down,
+                "explode_rate": round(explode_rate, 2),
+                "market_mood": market_mood_value,
+                "market_mood_text": MARKET_MOOD_MAP.get(market_mood_value, "未知")
+            },
+            "previous": {
+                "date": display_date,
+                "first_limit": today_first - random.randint(-5, 5),
+                "continuous_limit": today_continuous - random.randint(-3, 3),
+                "exploded": today_exploded - random.randint(-2, 2),
+                "limit_down": today_limit_down - random.randint(-3, 3),
+                "explode_rate": 0,
+                "market_mood": 3,
+                "market_mood_text": "正常"
+            },
+            "change": {
+                "first_limit": random.randint(-5, 5),
+                "continuous_limit": random.randint(-3, 3),
+                "exploded": random.randint(-2, 2),
+                "limit_down": random.randint(-3, 3)
+            },
+            "median": {
+                "first_limit": 30.0,
+                "continuous_limit": 18.0,
+                "exploded": 6.0,
+                "limit_down": 10.0
+            },
+            "history": self.history_data,
+            "analysis": "当前使用备用数据源，暂无数据库数据。"
+        }
+
+    async def _get_fallback_limit_stats(self) -> Dict:
+        """兼容旧版API的备用数据（已废弃，由_get_fallback_limit_stats_db_mode替代）"""
+        return await self._get_fallback_limit_stats_db_mode()
+
+    async def get_continuous_limits(self, query_date: str = None) -> List[Dict]:
+        """获取连板榜数据
+
+        Args:
+            query_date: 查询日期，格式：YYYY-MM-DD，如果不提供则使用实时数据
+
+        Returns:
+            List[Dict]: 连板数据列表
+        """
+        try:
+            # 如果提供了查询日期，从数据库读取历史数据
+            if query_date:
+                return db.get_continuous_limits_by_date(query_date)
+
+            # 否则使用实时数据
+            cached = self._get_cached_data("continuous_limits")
+            if cached and not self.is_trading_time():
+                return cached
+
+            df = self._get_realtime_data()
+
+            if df is None or len(df) < 10:
+                return await self._get_fallback_continuous_limits()
+
+            limit_up = df[df['涨跌幅'] >= 9.9].copy()
+            
+            continuous_limits = []
+            idx = 0
+            
+            for _, row in limit_up.iterrows():
+                if idx >= 12:
+                    break
+                
+                price = row.get('最新价', 0)
+                if pd.isna(price) or price == 0:
+                    continue
+                
+                code = str(row.get('代码', ''))
+                name = str(row.get('名称', ''))
+                change = float(row.get('涨跌幅', 0))
+                amount = float(row.get('成交额', 0)) / 100000000 if pd.notna(row.get('成交额')) else 0
+                
+                days = random.choice([2, 2, 2, 3, 3, 4, 5])
+                
+                continuous_limits.append({
+                    "code": code,
+                    "name": name,
+                    "price": round(float(price), 2),
+                    "change_percent": round(change, 2),
+                    "continuous_days": days,
+                    "reason": "持续强势",
+                    "sector": "市场热点",
+                    "amount": round(amount, 1)
+                })
+                idx += 1
+            
+            continuous_limits.sort(key=lambda x: x["continuous_days"], reverse=True)
+            result = continuous_limits[:10]
+            
+            self._save_cached_data("continuous_limits", result)
+            return result
+            
+        except Exception as e:
+            logger.error(f"获取连板数据失败: {e}", exc_info=True)
+            return await self._get_fallback_continuous_limits()
+    
+    async def _get_fallback_continuous_limits(self) -> List[Dict]:
+        hot_stocks = [
+            ("600000", "浦发银行", 8.45, "银行"),
+            ("601398", "工商银行", 5.23, "银行"),
+            ("000001", "平安银行", 12.34, "银行"),
+            ("002594", "比亚迪", 245.80, "新能源汽车"),
+            ("300750", "宁德时代", 185.60, "新能源"),
+            ("000858", "五粮液", 156.78, "白酒"),
+            ("600519", "贵州茅台", 1650.00, "白酒"),
+            ("000333", "美的集团", 62.34, "家电"),
+            ("000002", "万科A", 18.56, "房地产"),
+            ("600176", "东方通信", 8.56, "通信"),
+        ]
+        
+        continuous_limits = []
+        for code, name, price, sector in hot_stocks:
+            days = random.choice([2, 2, 2, 3, 3, 4, 5])
+            continuous_limits.append({
+                "code": code,
+                "name": name,
+                "price": price,
+                "change_percent": round(random.uniform(9.95, 10.05), 2),
+                "continuous_days": days,
+                "reason": "持续强势",
+                "sector": sector,
+                "amount": round(random.uniform(5, 35), 1)
+            })
+        
+        continuous_limits.sort(key=lambda x: x["continuous_days"], reverse=True)
+        return continuous_limits[:10]
+    
+    async def get_continuous_limit_analysis(self, query_date: str = None) -> Dict:
+        """获取连板梯队分析（从数据库读取）
+
+        Args:
+            query_date: 查询日期，格式：YYYY-MM-DD，如果不提供则使用 get_display_trade_date()
+
+        Returns:
+            {
+                "trade_date": "2025-01-31",
+                "analysis": "分析内容...",
+                "update_time": "2025-01-31T16:00:00",
+                "limits_data": [...]  # 连板历史数据列表
+            }
+        """
+        try:
+            if query_date is None:
+                query_date = get_display_trade_date()
+
+            # 查询分析文本
+            analysis_data = db.get_continuous_limits_analysis(query_date)
+            if analysis_data:
+                analysis_text = analysis_data.get('analysis', '')
+                update_time = analysis_data.get('update_time', '')
+            else:
+                analysis_text = ''
+                update_time = ''
+
+            # 查询历史数据
+            limits_history = db.get_continuous_limits_by_date(query_date)
+
+            # 查询连板数量（从 limit_stats 表获取准确的连板数）
+            limit_stats_data = db.get_limit_stats_by_date(query_date)
+            continuous_limit_count = limit_stats_data.get('continuous_limit', 0) if limit_stats_data else len([x for x in limits_history if x.get('continuous_days', 0) >= 2])
+
+            result = {
+                "trade_date": query_date,
+                "analysis": analysis_text,
+                "update_time": update_time,
+                "limits_data": limits_history,
+                "continuous_limit_count": continuous_limit_count
+            }
+            return result
+
+        except Exception as e:
+            logger.error(f"获取连板分析失败: {e}", exc_info=True)
+            return {
+                "trade_date": query_date or get_display_trade_date(),
+                "analysis": "",
+                "update_time": "",
+                "limits_data": [],
+                "continuous_limit_count": 0,
+                "error": str(e)
+            }
+    
+    async def get_sector_analysis(self) -> Dict:
+        try:
+            cached = self._get_cached_data("sectors")
+            if cached and not self.is_trading_time():
+                return cached
+            
+            try:
+                df_sector = ak.stock_sector_spot()
+                if df_sector is not None and len(df_sector) > 0:
+                    sector_list = []
+                    for _, row in df_sector.head(15).iterrows():
+                        sector_list.append({
+                            "name": str(row.get('板块', row.get('label', '')))[:8],
+                            "change_percent": round(float(row.get('个股-涨跌幅', 0)), 2),
+                            "limit_up_count": 0,
+                            "hot": float(row.get('个股-涨跌幅', 0)) >= 2,
+                            "days": 1
+                        })
+                    
+                    sector_list.sort(key=lambda x: x["change_percent"], reverse=True)
+                    hot_sectors = [s for s in sector_list if s["hot"]]
+                    
+                    # 加载保存的题材轮动分析数据
+                    rotation_data = self._load_rotation_analysis()
+                    
+                    result = {
+                        "timestamp": datetime.now().isoformat(),
+                        "sectors": sector_list,
+                        "hot_sectors": hot_sectors[:8],
+                        "sector_rotation": rotation_data
+                    }
+                    
+                    self._save_cached_data("sectors", result)
+                    return result
+            except Exception as e:
+                logger.warning(f"获取板块数据失败: {e}")
+            
+            fallback_data = await self._get_fallback_sector_analysis()
+            # 加载保存的题材轮动分析数据
+            rotation_data = self._load_rotation_analysis()
+            fallback_data["sector_rotation"] = rotation_data
+            return fallback_data
+            
+        except Exception as e:
+            logger.error(f"获取题材数据失败: {e}", exc_info=True)
+            return {"timestamp": datetime.now().isoformat(), "sectors": [], "hot_sectors": [], "sector_rotation": []}
+    
+    def _load_rotation_analysis(self) -> List[Dict]:
+        """从数据库加载题材轮动分析数据
+
+        核心逻辑：
+        1. 从交易日表获取最近5个交易日期
+        2. 基于这些日期查询题材数据
+        3. 即使某天没有题材数据也能正常显示
+        """
+        try:
+            # 使用应该展示的交易日期作为基准（凌晨时为上一个交易日）
+            # 注意：题材轮动分析需要展示最近交易日，即使没有数据也要展示日期
+            display_trade_date = get_display_trade_date(query_existing_data=False)
+            display_date_obj = datetime.strptime(display_trade_date, "%Y-%m-%d").date()
+
+            # 从交易日表获取最近5个交易日（基于当前应该展示的交易日期）
+            recent_trading_dates = get_recent_trading_days(5, display_trade_date)
+
+            if not recent_trading_dates:
+                logger.warning("无法获取交易日，返回默认数据")
+                return self._get_default_rotation_data()
+
+            # 查询这些交易日的题材数据
+            conn = db._get_connection()
+            cursor = conn.cursor()
+            
+            # 获取所有题材
+            cursor.execute('SELECT topic_id, topic_name FROM topics WHERE is_active = 1')
+            all_topics = cursor.fetchall()
+            
+            # 查询这些日期的题材分析数据
+            topics_dict = {}
+            
+            for topic_id, topic_name in all_topics:
+                topics_dict[topic_name] = {
+                    'name': topic_name,
+                    'days': {},
+                    'stages': {},
+                    'hot': False
+                }
+
+            # 查询最近5个交易日的数据
+            placeholders = ','.join(['?'] * len(recent_trading_dates))
+            cursor.execute(f'''
+                SELECT t.topic_name, ra.date, ra.content, ra.is_active, ra.stage
+                FROM rotation_actives ra
+                JOIN topics t ON ra.topic_id = t.topic_id
+                WHERE ra.date IN ({placeholders})
+                ORDER BY t.topic_name, ra.date
+            ''', tuple(recent_trading_dates))
+
+            records = cursor.fetchall()
+            conn.close()
+
+            # 填充数据到 topics_dict
+            for topic_name, date_str, content, is_active, stage in records:
+                if topic_name not in topics_dict:
+                    continue
+
+                # 计算相对天数（给前端用），相对于应该展示的交易日期
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                day_diff = int((date_obj - display_date_obj).days)
+
+                topics_dict[topic_name]['days'][str(day_diff)] = content or ''
+                topics_dict[topic_name]['stages'][str(day_diff)] = stage
+
+                if is_active == 1 and content and content.strip():
+                    topics_dict[topic_name]['hot'] = True
+            
+            # 确保包含所有交易日（即使没有数据）
+            for topic_data in topics_dict.values():
+                for date_str in recent_trading_dates:
+                    date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    day_diff = int((date_obj - display_date_obj).days)
+                    
+                    day_str = str(day_diff)
+                    if day_str not in topic_data['days']:
+                        topic_data['days'][day_str] = ''
+            
+            # 转换为列表并按日期排序
+            topics_result = []
+            for topic_data in topics_dict.values():
+                # 获取day值的列表并排序（从早到晚）
+                day_keys = sorted([int(d) for d in topic_data['days'].keys()])
+
+                # 创建有序的days字典和stages字典
+                ordered_days = {}
+                ordered_stages = {}
+                for day in day_keys:
+                    ordered_days[str(day)] = topic_data['days'][str(day)]
+                    if 'stages' in topic_data and str(day) in topic_data['stages']:
+                        ordered_stages[str(day)] = topic_data['stages'][str(day)]
+
+                topics_result.append({
+                    'name': topic_data['name'],
+                    'days': ordered_days,
+                    'stages': ordered_stages,
+                    'hot': topic_data['hot']
+                })
+            
+            # 按最近一天是否有内容排序
+            if day_keys:
+                latest_day = str(day_keys[-1])
+                topics_result.sort(key=lambda x: len(x['days'][latest_day]) if latest_day in x['days'] else 0, reverse=True)
+
+            return topics_result
+
+        except Exception as e:
+            logger.warning(f"加载题材轮动分析失败: {e}", exc_info=True)
+            return self._get_default_rotation_data()
+    
+    def _get_default_rotation_data(self) -> List[Dict]:
+        """获取默认的题材数据（01-22到01-31）"""
+        default_topics = [
+            {
+                "name": "人工智能",
+                "days": {
+                    "-9": "AI大模型应用落地加速，个股表现活跃",
+                    "-8": "多只概念股涨停，板块热度攀升",
+                    "-7": "板块轮动加速，资金持续流入",
+                    "-6": "出现分化调整，部分个股冲高回落",
+                    "-5": "早盘逆势拉升，但后劲不足",
+                    "-4": "板块整体震荡整理，等待新催化",
+                    "-3": "午后突然拉升，资金回流迹象明显",
+                    "-2": "与指数共振上涨，多股封板",
+                    "-1": "指数下跌时逆势上扬，多只个股走强"
+                },
+                "hot": True
+            },
+            {
+                "name": "半导体",
+                "days": {
+                    "-9": "国产替代概念升温，资金关注度高",
+                    "-8": "板块表现强势，多股冲击涨停",
+                    "-7": "技术突破消息刺激，板块全线上涨",
+                    "-6": "高位震荡，分歧加大",
+                    "-5": "获利盘回吐，板块跌幅居前",
+                    "-4": "探底回升，显示支撑较强",
+                    "-3": "跟随指数反弹，但量能不足",
+                    "-2": "震荡加剧，关注后续走势",
+                    "-1": "缩量调整，获利盘有所出逃"
+                },
+                "hot": False
+            },
+            {
+                "name": "新能源",
+                "days": {
+                    "-9": "",
+                    "-8": "利好消息刺激，板块快速拉升",
+                    "-7": "板块联动上涨，多股涨停",
+                    "-6": "高位震荡，分歧开始显现",
+                    "-5": "获利盘出逃，板块大幅回调",
+                    "-4": "止跌企稳，低位承接良好",
+                    "-3": "弱势震荡，等待新方向",
+                    "-2": "",
+                    "-1": "午后有异动，但持续性不佳"
+                },
+                "hot": False
+            },
+            {
+                "name": "机器人",
+                "days": {
+                    "-9": "产业政策利好，板块启动",
+                    "-8": "",
+                    "-7": "",
+                    "-6": "",
+                    "-5": "龙头股涨停，带动板块走强",
+                    "-4": "板块分化，轮动加快",
+                    "-3": "",
+                    "-2": "午后和指数共振拉升，但是上板标的不多",
+                    "-1": "跟随指数调整，等待机会"
+                },
+                "hot": False
+            },
+            {
+                "name": "光伏",
+                "days": {
+                    "-9": "",
+                    "-8": "",
+                    "-7": "",
+                    "-6": "",
+                    "-5": "",
+                    "-4": "",
+                    "-3": "",
+                    "-2": "开盘逆势拉升，近期人气标的在开盘做出逆势拉升",
+                    "-1": ""
+                },
+                "hot": False
+            },
+            {
+                "name": "苏超",
+                "days": {
+                    "-9": "",
+                    "-8": "",
+                    "-7": "",
+                    "-6": "",
+                    "-5": "",
+                    "-4": "",
+                    "-3": "",
+                    "-2": "",
+                    "-1": ""
+                },
+                "hot": False
+            }
+        ]
+        return default_topics
+    
+    async def _get_fallback_sector_analysis(self) -> Dict:
+        all_sectors = [
+            ("银行", 2.8, 6),
+            ("人工智能", 4.3, 4),
+            ("新能源汽车", 3.2, 3),
+            ("半导体", 3.5, 3),
+            ("白酒", 2.1, 3),
+            ("光伏", 3.8, 2),
+            ("通信", 2.9, 2),
+            ("房地产", 1.5, 2),
+        ]
+        
+        sector_list = []
+        for name, change, limit_up in all_sectors:
+            sector_list.append({
+                "name": name,
+                "change_percent": change,
+                "limit_up_count": limit_up,
+                "hot": change >= 2.5,
+                "days": 1
+            })
+        
+        sector_list.sort(key=lambda x: x["change_percent"], reverse=True)
+        
+        hot_sectors = [s for s in sector_list if s["hot"]]
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "sectors": sector_list,
+            "hot_sectors": hot_sectors[:6]
+        }
+
+    async def get_first_limits(self) -> List[Dict]:
+        """从数据库获取今日首板数据"""
+        try:
+            # 根据当前时间判断应该查询哪个交易日
+            # 在9:15之前或非交易日，查询上一个交易日
+            # 在9:15及之后的交易日，查询当天
+            trading_date = get_query_trading_date()
+
+            logger.info(f"查询首板数据，交易日：{trading_date}")
+            records = db.get_first_limits_by_date(trading_date)
+
+            first_limits = []
+            for record in records:
+                first_limits.append({
+                    'code': record['code'],
+                    'name': record['name'],
+                    'price': record['price'],
+                    'change_percent': 10.0 if record['limit_type'] == '10%' else (20.0 if record['limit_type'] == '20%' else 30.0),
+                    'first_time': record['first_time'] or '09:30',
+                    'sector': record['sector'] or '综合',
+                    'reason': record['reason'],
+                    'stock_id': record['stock_id'],
+                    'id': record['id']
+                })
+
+            first_limits.sort(key=lambda x: x['first_time'])
+            return first_limits[:12]
+
+        except Exception as e:
+            logger.error(f"获取首板数据失败: {e}", exc_info=True)
+            return await self._get_fallback_first_limits()
+    
+    async def _get_fallback_first_limits(self) -> List[Dict]:
+        first_stocks = [
+            ("600000", "浦发银行", 8.45, "银行"),
+            ("601398", "工商银行", 5.23, "银行"),
+            ("601288", "农业银行", 3.45, "银行"),
+            ("601166", "兴业银行", 18.90, "银行"),
+            ("601939", "建设银行", 6.78, "银行"),
+            ("002142", "宁波银行", 24.56, "银行"),
+            ("601818", "光大银行", 3.78, "银行"),
+            ("601229", "上海银行", 7.89, "银行"),
+        ]
+        
+        num_stocks = random.randint(6, 10)
+        selected = random.sample(first_stocks, min(num_stocks, len(first_stocks)))
+        
+        first_limits = []
+        base_time = datetime.strptime("09:30", "%H:%M")
+        
+        for i, (code, name, price, sector) in enumerate(selected):
+            minutes_offset = i * random.randint(2, 5)
+            time_str = (base_time + timedelta(minutes=minutes_offset)).strftime("%H:%M")
+            
+            first_limits.append({
+                "code": code,
+                "name": name,
+                "price": round(price + random.uniform(0, 0.3), 2),
+                "change_percent": round(random.uniform(9.95, 10.1), 2),
+                "first_time": time_str,
+                "sector": sector,
+                "reason": "首板涨停"
+            })
+        
+        first_limits.sort(key=lambda x: x["first_time"])
+        return first_limits[:10]
+    
+    async def get_hot_stocks(self) -> List[Dict]:
+        return await self.get_popularity_stocks()
+    
+    async def get_market_summary(self, query_date: str = None) -> Dict:
+        """获取市场整体状态总结（从数据库读取）
+
+        Args:
+            query_date: 查询日期，格式：YYYY-MM-DD，如果不提供则使用 get_display_trade_date()
+
+        Returns:
+            {
+                "trade_date": "2025-01-31",
+                "content": "总结内容...",
+                "update_time": "2025-01-31T16:00:00",
+                "modified_time": "2025-01-31T16:00:00"
+            }
+        """
+        try:
+            if query_date is None:
+                query_date = get_display_trade_date()
+
+            summary_data = db.get_market_status_summary(query_date)
+
+            if summary_data:
+                content = summary_data.get('summary_content', '')
+                update_time = summary_data.get('update_time', '')
+            else:
+                content = ''
+                update_time = ''
+
+            result = {
+                "trade_date": query_date,
+                "content": content,
+                "update_time": update_time,
+                "modified_time": datetime.now().isoformat()
+            }
+
+            return result
+
+        except Exception as e:
+            logger.error(f"获取市场总结失败: {e}", exc_info=True)
+            return {
+                "trade_date": query_date or get_display_trade_date(),
+                "content": "",
+                "update_time": "",
+                "modified_time": datetime.now().isoformat()
+            }
+
+    async def get_stock_popularity_data(self, trade_date: str = None):
+        """
+        获取标的热度板块数据（支持日期选择器）
+
+        Args:
+            trade_date: 交易日期（日期选择器选中的日期）
+
+        Returns:
+            标的热度数据
+        """
+        try:
+            # 获取人气榜数据源 - 包含"人气、热度"相关数据
+            # 关联关系：
+            # - 调用 db_operations.get_popularity_sources() (line 2253)
+            # - 返回 popularity_sources 给前端 /api/hot-stocks
+            # - 前端 renderPopularitySubTabs() 使用此数据渲染子选项卡
+            # 过滤说明：只获取"新高榜"数据源（半年新高、一年新高、历史新高）
+            popularity_sources = db.get_popularity_sources()
+
+            # 获取成交额榜类型
+            amount_types = db.get_amount_types()
+
+            # 获取人气榜标的数据
+            # 关联关系：
+            # - 调用 db_operations.get_popularity_stocks() (line 2369)
+            # - 返回 popularity_data 给前端 /api/hot-stocks
+            # - 前端 updateHotStocksCard() 使用此数据更新人气榜内容
+            # 过滤说明：只处理"新高榜"数据源
+            popularity_data = []
+            for source in popularity_sources:
+                stocks = db.get_popularity_stocks(source['source_id'], trade_date)
+                popularity_data.append({
+                    'source_id': source['source_id'],
+                    'source_name': source['source_name'],
+                    'stocks': stocks
+                })
+
+            amount_data = []
+            for amt_type in amount_types:
+                stocks = db.get_amount_stocks(amt_type['type_id'], trade_date)
+                amount_data.append({
+                    'type_id': amt_type['type_id'],
+                    'type_name': amt_type['type_name'],
+                    'stocks': stocks
+                })
+
+            return {
+                "success": True,
+                "trade_date": trade_date,
+                "popularity_sources": popularity_sources,
+                "popularity_data": popularity_data,
+                "amount_types": amount_types,
+                "amount_data": amount_data
+            }
+        except Exception as e:
+            logger.error(f"获取标的热度板块数据失败: {e}", exc_info=True)
+            return {"success": False, "message": str(e), "trade_date": trade_date, "popularity_sources": [], "popularity_data": [], "amount_types": [], "amount_data": []}
+
+@app.get("/api/limit-stats")
+async def get_limit_statistics(query_date: str = None):
+    data = await StockDataService().get_limit_stats(query_date)
+    return data
+
+
+@app.post("/api/limit-stats/save")
+async def save_limit_statistics(
+    trade_date: str = Body(..., description="交易日期，格式：YYYY-MM-DD"),
+    first_limit: int = Body(..., description="首板数量"),
+    continuous_limit: int = Body(..., description="连板数量"),
+    exploded: int = Body(..., description="炸板数量"),
+    limit_down: int = Body(..., description="跌停数量"),
+    explode_rate: float = Body(..., description="炸板率（百分比）"),
+    market_mood: int = Body(3, description="市场情绪（1=低迷, 2=谨慎, 3=正常, 4=活跃, 5=狂热）")
+):
+    """保存涨跌停统计数据（收盘后调用）"""
+    try:
+        affected = db.save_limit_stats(
+            trade_date=trade_date,
+            first_limit=first_limit,
+            continuous_limit=continuous_limit,
+            exploded=exploded,
+            limit_down=limit_down,
+            explode_rate=explode_rate,
+            market_mood=market_mood
+        )
+        return {"success": True, "message": f"成功保存{affected}条记录"}
+    except Exception as e:
+        logger.error(f"保存涨跌停统计数据失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/limit-stats/analysis")
+async def save_limit_analysis(
+    trade_date: str = Body(..., description="交易日期，格式：YYYY-MM-DD"),
+    analysis: str = Body(..., description="分析说明内容")
+):
+    """保存涨跌停分析说明"""
+    try:
+        affected = db.save_limit_analysis(trade_date, analysis)
+        return {"success": True, "message": f"成功保存{affected}条记录"}
+    except Exception as e:
+        logger.error(f"保存涨跌停分析失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/limit-stats/refresh")
+async def refresh_limit_statistics(targetDate: str = Body(..., embed=True, description="要刷新的目标日期")):
+    """手动刷新涨停统计数据（用户主动触发）
+
+    当用户点击刷新按钮时调用此API，
+    会使用用户通过日期选择器选择的日期获取涨停数据并保存到数据库
+
+    Args:
+        targetDate: 用户通过日期选择器选择的目标日期（格式：YYYY-MM-DD）
+    """
+    try:
+        from src.data_acquisition import DataAcquisitionService
+
+        logger.info("手动刷新涨停数据开始")
+        logger.info(f"用户选择的刷新日期: {targetDate}")
+
+        service = DataAcquisitionService()
+
+        # 直接使用用户传递的日期进行查询和保存
+        result = service.fetch_and_save_limit_data(targetDate)
+
+        logger.info(f"手动刷新涨停数据完成: {result}")
+        
+        # 检查是否需要提示新高数据限制
+        high_data_updated = True  # 默认认为有更新
+        if targetDate:
+            # 获取最新交易日
+            try:
+                from data.db_operations import get_latest_trading_date_from_db
+                latest_trading_date = get_latest_trading_date_from_db()
+                if latest_trading_date and targetDate != latest_trading_date:
+                    high_data_updated = False
+            except Exception as e:
+                logger.warning(f"检查新高数据更新状态失败: {e}")
+        
+        return {
+            "success": result.get("success", False) or (result.get("first_limit_count", 0) > 0 or result.get("continuous_limit_count", 0) > 0),
+            "message": result.get("message", ""),
+            "first_limit_count": result.get("first_limit_count", 0),
+            "continuous_limit_count": result.get("continuous_limit_count", 0),
+            "exploded_count": result.get("exploded_count", 0),
+            "limit_down_count": result.get("limit_down_count", 0),
+            "total_records": result.get("total_records", 0),
+            "trade_date": targetDate,
+            "high_data_updated": high_data_updated,
+            "high_data_message": "新高数据已更新" if high_data_updated else "新高数据未更新（仅支持刷新最新交易日）"
+        }
+    except Exception as e:
+        logger.error(f"手动刷新涨停数据失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/market-summary/save")
+async def save_market_summary(
+    trade_date: str = Body(..., description="交易日期，格式：YYYY-MM-DD"),
+    summary_content: str = Body(..., description="总结内容")
+):
+    """保存市场整体状态总结"""
+    try:
+        affected = db.save_market_status_summary(trade_date, summary_content)
+        return {"success": True, "message": f"成功保存{affected}条记录"}
+    except Exception as e:
+        logger.error(f"保存市场整体状态总结失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/market-summary/{trade_date}")
+async def get_market_summary_by_date(trade_date: str):
+    """获取指定交易日的市场整体状态总结"""
+    try:
+        data = await StockDataService().get_market_summary(trade_date)
+        return data
+    except Exception as e:
+        logger.error(f"获取市场整体状态总结失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/continuous-limits/analysis/save")
+async def save_continuous_limits_analysis(
+    trade_date: str = Body(..., description="交易日期，格式：YYYY-MM-DD"),
+    analysis: str = Body(..., description="分析说明内容")
+):
+    """保存连板梯队分析说明"""
+    try:
+        affected = db.save_continuous_limits_analysis(trade_date, analysis)
+        return {"success": True, "message": f"成功保存{affected}条记录"}
+    except Exception as e:
+        logger.error(f"保存连板梯队分析失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/continuous-limits/analysis/{trade_date}")
+async def get_continuous_limits_analysis_by_date(trade_date: str):
+    """获取指定交易日的连板梯队分析"""
+    try:
+        data = await StockDataService().get_continuous_limit_analysis(trade_date)
+        return data
+    except Exception as e:
+        logger.error(f"获取连板梯队分析失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/continuous-limits/{trade_date}")
+async def get_continuous_limits_by_date(trade_date: str):
+    """获取指定交易日的连板历史数据"""
+    try:
+        data = db.get_continuous_limits_by_date(trade_date)
+        return {"continuous_limits": data}
+    except Exception as e:
+        logger.error(f"获取连板历史数据失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/continuous-limits")
+async def get_continuous_limits():
+    data = await StockDataService().get_continuous_limits()
+    return {"continuous_limits": data}
+
+@app.get("/api/continuous-limit-analysis")
+async def get_continuous_limit_analysis():
+    data = await StockDataService().get_continuous_limit_analysis()
+    return data
+
+@app.get("/api/sectors")
+async def get_sectors():
+    data = await StockDataService().get_sector_analysis()
+    return data
+
+@app.get("/api/change-stocks")
+async def get_change_stocks():
+    data = await StockDataService().get_change_stocks()
+    return data
+
+@app.get("/api/first-limits")
+async def get_first_limits(date: str = None):
+    """获取首板数据，指定日期则从数据库读取，否则使用 AkShare 实时获取"""
+    try:
+        if date:
+            # 从数据库读取指定日期的首板数据
+            records = db.get_first_limits_by_date(date)
+
+            # 转换为前端格式
+            first_limits = []
+            for record in records:
+                first_limits.append({
+                    'code': record['code'],
+                    'name': record['name'],
+                    'price': record['price'],
+                    'change_percent': 10.0 if record['limit_type'] == '10%' else (20.0 if record['limit_type'] == '20%' else 30.0),
+                    'first_time': record['first_time'] or '09:30',
+                    'sector': record['sector'] or '综合',
+                    'reason': record['reason'],
+                    'stock_id': record['stock_id'],
+                    'id': record['id']
+                })
+
+            # 按时间排序
+            first_limits.sort(key=lambda x: x['first_time'])
+            return {"first_limits": first_limits}
+        else:
+            # 使用 AkShare 实时获取（临时方案，后续会逐步替换）
+            data = await StockDataService().get_first_limits()
+            return {"first_limits": data}
+    except Exception as e:
+        logger.error(f"获取首板数据失败: {e}", exc_info=True)
+        return {"first_limits": []}
+
+@app.get("/api/market-summary")
+async def get_market_summary():
+    data = await StockDataService().get_market_summary()
+    return data
+
+@app.post("/api/save-rotation-analysis")
+async def save_rotation_analysis(analysis: Dict = Body(...)):
+    """保存题材轮动分析
+
+    支持两种日期格式：
+    - day: 相对天数（如 -1 表示昨天）
+    - date: 绝对日期（YYYY-MM-DD 格式）
+
+    优先级：day > date > 今天
+    """
+    try:
+        topic = analysis.get('topic')
+        content = analysis.get('content', '')
+        stage = analysis.get('stage')
+        timestamp = analysis.get('timestamp', datetime.now().isoformat())
+
+        # 获取日期：优先使用 day，然后 date，最后默认今天
+        day = analysis.get('day')
+        date = analysis.get('date', datetime.now().strftime("%Y-%m-%d"))
+
+        if day is not None:
+            # 如果提供了 day，计算绝对日期
+            target_date = datetime.now().date() + timedelta(days=day)
+            date = target_date.strftime("%Y-%m-%d")
+        elif 'date' in analysis and analysis['date']:
+            # 如果提供了 date，直接使用
+            date = analysis['date']
+        else:
+            # 如果都没提供，使用今天
+            date = datetime.now().strftime("%Y-%m-%d")
+
+        success = db.save_analysis(topic, content, date, timestamp=timestamp, stage=stage)
+
+        if success:
+            return {"success": True, "message": "分析保存成功"}
+        else:
+            return {"success": False, "message": "保存失败"}
+    except Exception as e:
+        logger.error(f"保存题材轮动分析失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+@app.get("/api/rotation-history")
+async def get_rotation_history(offset: int = 0):
+    """加载题材轮动历史数据，从数据库读取最近5个交易日"""
+    try:
+        display_trade_date = get_display_trade_date(query_existing_data=False)
+        display_date_obj = datetime.strptime(display_trade_date, "%Y-%m-%d").date()
+
+        # 使用今天（而非展示日期）作为day值的基准
+        today = datetime.now().date()
+
+        recent_trading_dates = get_recent_trading_days(5, display_trade_date)
+        
+        if not recent_trading_dates:
+            logger.warning("无法获取交易日，返回空数据")
+            return {"topics": [], "dates": []}
+
+        conn = db._get_connection()
+        cursor = conn.cursor()
+
+        # 获取所有活跃题材
+        cursor.execute('SELECT topic_id, topic_name FROM topics WHERE is_active = 1')
+        all_topics = cursor.fetchall()
+
+        # 初始化所有题材
+        topics_data = {}
+        for topic_id, topic_name in all_topics:
+            topics_data[topic_name] = {
+                'name': topic_name,
+                'days': {},
+                'stages': {},
+                'hot': False
+            }
+
+        # 查询这些交易日的题材分析数据
+        placeholders = ','.join(['?'] * len(recent_trading_dates))
+        cursor.execute(f'''
+            SELECT t.topic_name, ra.date, ra.content, ra.is_active, ra.stage
+            FROM rotation_actives ra
+            JOIN topics t ON ra.topic_id = t.topic_id
+            WHERE ra.date IN ({placeholders})
+            ORDER BY t.topic_name, ra.date
+        ''', tuple(recent_trading_dates))
+
+        records = cursor.fetchall()
+        conn.close()
+
+        # 填充数据到 topics_data
+        for topic_name, date_str, content, is_active, stage in records:
+            if topic_name not in topics_data:
+                continue
+
+            # 计算相对天数（相对于今天）
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+            day_diff = int((date_obj - today).days)
+
+            topics_data[topic_name]['days'][str(day_diff)] = content or ''
+            topics_data[topic_name]['stages'][str(day_diff)] = stage
+
+            # 如果某天有活跃内容，标记为热门
+            if is_active == 1 and content and content.strip():
+                topics_data[topic_name]['hot'] = True
+
+        # 确保包含所有交易日（即使没有数据）
+        for topic_data in topics_data.values():
+            for date_str in recent_trading_dates:
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                day_diff = int((date_obj - today).days)
+
+                day_str = str(day_diff)
+                if day_str not in topic_data['days']:
+                    topic_data['days'][day_str] = ''
+
+        # 转换为列表并按日期排序
+        topics_result = []
+        day_keys = []
+        for topic_data in topics_data.values():
+            # 获取day值的列表并排序（从早到晚）
+            topic_day_keys = sorted([int(d) for d in topic_data['days'].keys()])
+            if not day_keys:
+                day_keys = topic_day_keys
+
+            # 创建有序的days字典
+            ordered_days = {}
+            for day in topic_day_keys:
+                ordered_days[str(day)] = topic_data['days'][str(day)]
+
+            topics_result.append({
+                'name': topic_data['name'],
+                'days': ordered_days,
+                'hot': topic_data['hot']
+            })
+
+        # 按最近一天是否有内容排序
+        if day_keys:
+            latest_day = str(day_keys[-1])
+            topics_result.sort(key=lambda x: len(x['days'][latest_day]) if latest_day in x['days'] else 0, reverse=True)
+
+        # 生成日期标签
+        dates_result = []
+        for day in day_keys:
+            date = today + timedelta(days=day)
+            date_str = date.strftime("%Y-%m-%d")
+            if day == 0:
+                label = "今日"
+            elif day == -1:
+                label = "昨日"
+            else:
+                label = date.strftime("%m-%d")
+            dates_result.append({'day': str(day), 'label': label, 'date': date_str})
+
+        return {
+            "topics": topics_result,
+            "dates": dates_result
+        }
+    except Exception as e:
+        logger.error(f"加载轮动历史失败: {e}")
+        return {"error": str(e)}
+    
+@app.post("/api/remove-topic-from-date")
+async def remove_topic_from_date(topic_data: Dict = Body(...)):
+    """根据日期删除题材记录"""
+    try:
+        topic = topic_data.get('topic')
+        date = topic_data.get('date')
+
+        if not topic:
+            return {"success": False, "message": "题材名称不能为空"}
+
+        if not date:
+            return {"success": False, "message": "必须提供 date 参数"}
+
+        success = db.remove_analysis(topic, date)
+
+        if success:
+            logger.info(f"删除成功 - 主题: {topic}, 日期: {date}")
+            return {"success": True, "message": "删除成功"}
+        else:
+            logger.info(f"删除失败 - 主题: {topic}, 日期: {date}")
+            return {"success": False, "message": f"未找到相关记录 (topic={topic}, date={date})"}
+    except Exception as e:
+        logger.error(f"删除题材失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+@app.post("/api/activate-topic")
+async def activate_topic(topic_data: Dict = Body(...)):
+    """激活/创建题材（今日首板板块快速添加功能）"""
+    try:
+        topic_name = topic_data.get('topic_name')
+        query_date = topic_data.get('queryDate')
+
+        if not topic_name:
+            return {"success": False, "message": "题材名称不能为空"}
+
+        # 获取当前查看的交易日期（开盘后应查看的交易日）
+        if query_date:
+            target_date = query_date
+        else:
+            target_date = db.get_query_trading_date()
+
+        if not target_date:
+            return {"success": False, "message": "无法获取交易日期"}
+
+        # 调用数据库方法激活题材
+        success, topic_id, message = db.activate_topic(topic_name, target_date)
+
+        if success:
+            return {
+                "success": True,
+                "message": "激活成功",
+                "topic_id": topic_id
+            }
+        else:
+            return {
+                "success": False,
+                "message": message
+            }
+    except Exception as e:
+        logger.error(f"激活题材失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+@app.get("/api/check-topic-stock-relations")
+async def check_topic_stock_relations(topic_id: int):
+    """检查题材在topic_stock_relations表中是否有持久关联
+    
+    今日首板删除题材的逻辑（重要！）：
+    - 只检查topic_stock_relations表中的持久关联
+    - 不检查first_limit_topics表中的临时关联
+    - 如果topic_stock_relations中有该题材的关联，则不能删除整个题材
+    - 避免删除题材后，其他日期的first_limit_topics中的topic_id变成孤儿引用
+    
+    参数说明：
+    - topic_id: 题材ID
+    
+    返回值：
+    - has_relations: 是否有持久关联
+    - stock_count: 关联的股票数量
+    """
+    try:
+        relations = db.check_topic_stock_relations(topic_id)
+        stock_count = len(relations) if relations else 0
+        
+        return {
+            "has_relations": stock_count > 0,
+            "stock_count": stock_count
+        }
+    except Exception as e:
+        logger.error(f"检查题材持久关联失败: {e}", exc_info=True)
+        return {"error": str(e), "has_relations": False, "stock_count": 0}
+
+@app.post("/api/delete-topic-card")
+async def delete_topic_card(topic_data: Dict = Body(...)):
+    """删除题材卡片（移除今日激活）"""
+    try:
+        topic_id = topic_data.get('topic_id')
+        query_date = topic_data.get('queryDate')
+
+        if not topic_id:
+            return {"success": False, "message": "题材ID不能为空"}
+
+        # 获取当前查看的交易日期（开盘后应查看的交易日）
+        if query_date:
+            target_date = query_date
+        else:
+            target_date = db.get_query_trading_date()
+
+        if not target_date:
+            return {"success": False, "message": "无法获取交易日期"}
+
+        # 调用数据库方法删除题材激活
+        success = db.remove_topic_activation(topic_id, target_date)
+
+        if success:
+            logger.info(f"删除题材卡片成功: topic_id={topic_id}, date={target_date}")
+            return {"success": True, "message": "删除成功"}
+        else:
+            logger.warning(f"删除题材卡片失败: topic_id={topic_id}, date={target_date}")
+            return {"success": False, "message": "删除失败：无可用的记录"}
+    except Exception as e:
+        logger.error(f"删除题材卡片失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+@app.post("/api/delete-topic")
+async def delete_topic(topic_data: Dict = Body(...)):
+    """删除整个题材（包括所有关联数据）"""
+    try:
+        topic_id = topic_data.get('topic_id')
+
+        if not topic_id:
+            return {"success": False, "message": "题材ID不能为空"}
+
+        success = db.delete_topic(topic_id)
+
+        if success:
+            logger.info(f"删除题材成功: topic_id={topic_id}")
+            return {"success": True, "message": "删除成功"}
+        else:
+            logger.warning(f"删除题材失败: topic_id={topic_id}")
+            return {"success": False, "message": "删除失败"}
+    except Exception as e:
+        logger.error(f"删除题材失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+@app.post("/api/update-topic-stage")
+async def update_topic_stage(data: Dict = Body(...)):
+    """更新题材的阶段状态"""
+    try:
+        topic = data.get('topic')
+        stage = data.get('stage')
+        date = data.get('date')
+
+        if not topic or not date:
+            return {"success": False, "message": "参数不完整"}
+
+        success = db.update_topic_stage(topic, stage, date)
+
+        if success:
+            return {"success": True, "message": "状态更新成功"}
+        else:
+            return {"success": False, "message": "状态更新失败"}
+    except Exception as e:
+        logger.error(f"更新题材状态失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+@app.get("/api/topics-by-stage")
+async def get_topics_by_stage(stage: str = "explosion", days: int = 24):
+    """
+    获取最近N个交易日中标记过特定状态的题材
+
+    参数：
+    - stage: 状态筛选（startup/explosion/maintain/divergence/recede/backflow/all）
+    - days: 查询的天数（默认24个交易日）
+
+    返回：
+    - topics: 题材列表（去重后的题材名称）
+    - dates: 查询的日期范围
+    - count: 题材数量
+    """
+    try:
+        conn = db._get_connection()
+        cursor = conn.cursor()
+
+        # 获取最近交易日期
+        cursor.execute('SELECT MAX(date) FROM rotation_actives')
+        result = cursor.fetchone()
+        if not result or not result[0]:
+            conn.close()
+            return {"topics": [], "dates": [], "count": 0}
+
+        latest_date = result[0]
+
+        # 获取最近N个交易日
+        cursor.execute('''
+            SELECT date FROM trading_days
+            WHERE date <= ? AND is_active = 1
+            ORDER BY date DESC
+            LIMIT ?
+        ''', (latest_date, days))
+
+        date_rows = cursor.fetchall()
+        trading_date_list = [row[0] for row in date_rows]
+
+        if not trading_date_list:
+            conn.close()
+            return {"topics": [], "dates": [], "count": 0}
+
+        # 查询这些日期中标记为指定状态的题材
+        placeholders = ','.join(['?'] * len(trading_date_list))
+        query = f'''
+            SELECT DISTINCT t.topic_name
+            FROM rotation_actives ra
+            JOIN topics t ON ra.topic_id = t.topic_id
+            WHERE ra.date IN ({placeholders})
+        '''
+
+        if stage != 'all':
+            query += ' AND ra.stage = ?'
+
+        cursor.execute(query, tuple(trading_date_list) + (stage,) if stage != 'all' else tuple(trading_date_list))
+
+        topic_rows = cursor.fetchall()
+        conn.close()
+
+        topics = [row[0] for row in topic_rows]
+
+        return {
+            "topics": topics,
+            "dates": trading_date_list,
+            "count": len(topics)
+        }
+    except Exception as e:
+        logger.error(f"获取题材状态列表失败: {e}", exc_info=True)
+        return {"error": str(e), "topics": [], "dates": [], "count": 0}
+
+@app.get("/api/all-topics")
+async def get_all_topics():
+    """获取所有题材列表，按最近添加排序"""
+    try:
+        topics_list = db.get_all_topics()
+
+        return {"topics": topics_list}
+    except Exception as e:
+        logger.error(f"获取题材列表失败: {e}")
+        return {"error": str(e)}
+
+@app.get("/api/topic-details")
+async def get_topic_details(topic_name: str = "", days: int = 24):
+    """
+    获取题材的详细历史数据（用于图表展示）
+
+    参数：
+    - topic_name: 题材名称
+    - days: 查询的天数（默认24个交易日）
+
+    返回：
+    - success: 是否成功
+    - topic_name: 题材名称
+    - dates: 日期列表（按最近的日期在前）
+    - first_limits: 每日首板数量
+    - continuous_limits: 每日连扳数量
+    - stages: 每日状态
+    """
+    try:
+        logger.info(f"[DEBUG] /api/topic-details 被调用: topic_name={topic_name}, days={days}")
+
+        if not topic_name:
+            return {"success": False, "error": "题材名称不能为空"}
+
+        # 获取题材ID
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT topic_id FROM topics WHERE topic_name = ?', (topic_name,))
+        result = cursor.fetchone()
+        conn.close()
+
+        if not result:
+            return {"success": False, "error": "题材不存在", "topic_name": topic_name}
+
+        topic_id = result[0]
+
+        # 获取统计数据
+        stats = db.get_topic_statistics_by_days(topic_id, days)
+
+        # 打印0209这一天的数据
+        if stats['dates']:
+            for i, date in enumerate(stats['dates']):
+                if '2025-02-09' in date or '0209' in date:
+                    logger.info(f"[DEBUG 0209] /api/topic-details: topic={topic_name}, date={date}, first_limit={stats['first_limits'][i]}, continuous_limit={stats['continuous_limits'][i]}, stage={stats['stages'][i]}")
+
+        return {
+            "success": True,
+            "topic_name": topic_name,
+            "dates": stats["dates"],
+            "first_limits": stats["first_limits"],
+            "continuous_limits": stats["continuous_limits"],
+            "stages": stats["stages"]
+        }
+    except Exception as e:
+        logger.error(f"获取题材详情失败: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "topic_name": topic_name}
+
+@app.get("/api/topic-active-stocks")
+async def get_topic_active_stocks(topic_name: str = "", days: int = 24):
+    """
+    获取题材近期活跃标的（近N个交易日有过涨停的股票）
+
+    参数：
+    - topic_name: 题材名称
+    - days: 查询的天数（默认24个交易日）
+
+    返回：
+    - success: 是否成功
+    - topic_name: 题材名称
+    - stocks: 活跃标的列表
+    """
+    try:
+        if not topic_name:
+            return {"success": False, "error": "题材名称不能为空"}
+
+        stocks = db.get_topic_active_stocks(topic_name, days)
+
+        return {
+            "success": True,
+            "topic_name": topic_name,
+            "stocks": stocks
+        }
+    except Exception as e:
+        logger.error(f"获取题材活跃标的失败: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "topic_name": topic_name}
+
+@app.post("/api/remove-topic-from-date")
+async def remove_topic_from_date(topic_data: Dict = Body(...)):
+    """删除某天某题材的记录"""
+    try:
+        topic = topic_data.get('topic')
+        date = topic_data.get('date')
+
+        if not topic:
+            return {"success": False, "message": "题材名称不能为空"}
+
+        if not date:
+            return {"success": False, "message": "必须提供 date 参数"}
+
+        success = db.remove_analysis(topic, date)
+
+        if success:
+            logger.info(f"删除成功 - 主题: {topic}, 日期: {date}")
+            return {"success": True, "message": "删除成功"}
+        else:
+            logger.info(f"删除失败 - 主题: {topic}, 日期: {date}")
+            return {"success": False, "message": f"未找到相关记录 (topic={topic}, date={date})"}
+    except Exception as e:
+        logger.error(f"删除题材失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+def try_parse_int(value):
+    """尝试将值转换为整数，失败则返回None"""
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+def get_market_summary_query_date(queryDate: str = None) -> str:
+    """获取市场整体状态总结和连板梯队的查询日期
+
+    规则：
+    - 15:00之前：返回数据库中的最新交易日
+    - 15:00及之后：
+        - 如果今天是交易日（从 trading_days 表判断），返回今天
+        - 否则返回数据库中的最新交易日
+    - 如果用户传递了 queryDate，直接返回 queryDate
+
+    Args:
+        queryDate: 用户选择的查询日期
+
+    Returns:
+        应该查询的交易日期字符串（格式：YYYY-MM-DD）
+    """
+    if queryDate:
+        return queryDate
+
+    now = datetime.now()
+    current_date = now.date().strftime("%Y-%m-%d")
+    current_time = now.time()
+
+    market_close_time = time(15, 0)
+
+    # 从 trading_days 表获取最新交易日（而不是从 limit_stats 表）
+    latest_trading_date_from_db = get_latest_trading_date_from_db()
+
+    if latest_trading_date_from_db is None:
+        # 数据库没有数据，返回最近工作日
+        logger.info("数据库中没有交易日数据，返回最近工作日")
+        latest_trading_date_from_db = get_last_trading_day()
+
+    # 如果时间 < 15:00，返回数据库中的最新交易日
+    if current_time < market_close_time:
+        logger.info(f"当前时间 {current_time} < 15:00，返回数据库最新交易日: {latest_trading_date_from_db}")
+        return latest_trading_date_from_db
+
+    # 时间 >= 15:00，检查今天是否是交易日
+    from src.db_operations import is_trading_day
+    today_is_trading_day = is_trading_day(current_date)
+
+    if today_is_trading_day:
+        logger.info(f"当前时间 >= 15:00 且今天是交易日，返回今天: {current_date}")
+        return current_date
+    else:
+        logger.info(f"当前时间 >= 15:00 且今天不是交易日，返回数据库最新交易日: {latest_trading_date_from_db}")
+        return latest_trading_date_from_db
+
+
+@app.get("/api/dashboard")
+async def get_dashboard_data(queryDate: str = None):
+    """
+    获取仪表盘数据
+
+    今日首板板块参数说明：
+    - queryDate: 前端传递的查询日期（格式：YYYY-MM-DD）
+    - 如果传递了 queryDate，使用该日期；否则使用 get_query_trading_date() 获取的日期
+    - 前端日期选择功能通过此参数支持查看历史交易日数据
+    """
+    try:
+        service = StockDataService()
+
+        # 涨跌停统计：如果传递了 queryDate，则使用该日期查询历史数据
+        limit_stats = await service.get_limit_stats(queryDate)
+        # 连板梯队：直接使用涨跌停统计的 display_date
+        continuous_limits_query_date = limit_stats.get('display_date') if limit_stats else None
+        continuous_limits = await service.get_continuous_limits(continuous_limits_query_date)
+
+        #        根据交易日规则获取查询日期
+        # 1. 今日首板：优先使用前端传递的 queryDate，否则使用 get_query_trading_date() 获取的日期
+        # 2. 市场整体状态总结和连板梯队：使用 get_market_summary_query_date()（15:00规则）
+        today = queryDate if queryDate else get_query_trading_date()
+        display_date = get_display_trade_date()
+
+        # 市场整体状态总结和连板梯队：直接使用涨跌停统计的 display_date
+        query_date_for_summary = continuous_limits_query_date
+        market_summary = await service.get_market_summary(query_date_for_summary)
+        continuous_analysis = await service.get_continuous_limit_analysis(query_date_for_summary)
+
+        # 其他板块不使用日期选择器
+        sectors = await service.get_sector_analysis()
+
+        # 首板数据：优先从数据库读取（包含 first_limit_id 和 stock_id）
+        db_first_limits = db.get_first_limits_by_date(today)
+
+        first_limits = []
+        if db_first_limits:
+            for record in db_first_limits:
+                first_limits.append({
+                    'code': record['code'],
+                    'name': record['name'],
+                    'price': record['price'],
+                    'change_percent': 10.0 if record['limit_type'] == '10%' else (20.0 if record['limit_type'] == '20%' else 30.0),
+                    'first_time': record['first_time'] or '09:30',
+                    'sector': record['sector'] or '综合',
+                    'reason': record['reason'],
+                    'stock_id': record['stock_id'],
+                    'id': record['id']
+                })
+            first_limits.sort(key=lambda x: x['first_time'])
+
+        # ========== 今日首板板块核心业务逻辑 ==========
+        # 1. topic_activations 表：决定显示哪些题材卡片（按日期记录）
+        # 2. first_limit_topics 表：记录首板与题材的关联（association_date = 首板与题材的真实活跃交易日）
+        # 3. 题材卡片中的标的信息：根据 topic_id + association_date 从 first_limit_topics 表查询
+        # 4. 关键点：只查询 topic_activations 表，不查询 topic_stock_relations（topic_stock_relations 是持久关联，由其他页面管理）
+        # 5. today 是 get_query_trading_date() 返回的日期（开盘后应查看的交易日），用于查询今日首板相关数据
+
+        today_topics = []
+        try:
+            # 核心步骤1：从 topic_activations 表获取 today 日期激活的题材（决定显示哪些题材卡片）
+            activated_topics = db.get_activated_topics(today)
+
+            # 核心步骤2：对每个激活的题材，查询 today 日期关联的首板标的（从 first_limit_topics 表）
+            for topic in activated_topics:
+                # 获取该题材在 today 关联的首板标的（使用 association_date 过滤）
+                stocks = db.get_topic_first_limits_by_association_date(topic['topic_id'], today)
+
+                if stocks:
+                    stocks_data = []
+                    for stock in stocks:
+                        stocks_data.append({
+                            'code': stock['code'],
+                            'name': stock['name'],
+                            'first_time': stock['first_time'] or '09:30',
+                            'change_percent': 10.0 if stock['limit_type'] == '10%' else (20.0 if stock['limit_type'] == '20%' else 30.0),
+                            'price': stock['price'],
+                            'sector': stock['sector'] or '综合',
+                            'reason': stock['reason'],
+                            'stock_id': stock['stock_id'],
+                            'id': stock['id']
+                        })
+
+                    today_topics.append({
+                        'topic_id': topic['topic_id'],
+                        'topic_name': topic['topic_name'],
+                        'stocks': sorted(stocks_data, key=lambda x: x['first_time'])
+                    })
+                else:
+                    # 空卡片（题材激活了但还没拖入首板）
+                    today_topics.append({
+                        'topic_id': topic['topic_id'],
+                        'topic_name': topic['topic_name'],
+                        'stocks': []
+                    })
+        except Exception as e:
+            logger.error(f"获取今日题材数据失败: {e}", exc_info=True)
+            today_topics = []
+
+        return {
+            "limit_stats": limit_stats,
+            "continuous_limits": continuous_limits,
+            "continuous_analysis": continuous_analysis,
+            "sectors": sectors,
+            "first_limits": first_limits,
+            "today_topics": today_topics,
+            "market_summary": market_summary,
+            "display_date": display_date,
+            "query_date": today,  # 今日首板板块使用的查询日期
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"获取仪表盘数据失败: {str(e)}", exc_info=True)
+        return {
+            "error": str(e),
+            "message": "获取数据失败",
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.get("/")
+async def dashboard(request: Request):
+    return templates.TemplateResponse("dashboard.html", {"request": request})
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "service": "A股复盘系统",
+        "version": "2.0.0",
+        "data_source": "AkShare",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/api/test")
+async def test_api():
+    try:
+        return {
+            "message": "API测试成功",
+            "is_trading": is_trading_day(),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "message": "API测试失败",
+            "error": str(e)
+        }
+
+@app.get("/api/save-analysis")
+async def save_analysis(analysis: dict):
+    try:
+        with open("data/analysis.json", "w", encoding='utf-8') as f:
+            json.dump(analysis, f, ensure_ascii=False, indent=2)
+        return {"success": True, "message": "分析保存成功"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+@app.get("/api/load-analysis")
+async def load_analysis():
+    try:
+        if os.path.exists("data/analysis.json"):
+            with open("data/analysis.json", "r", encoding='utf-8') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ============= 新增：基于日期的API接口（替代day）=============
+
+@app.get("/api/today")
+async def get_today():
+    """获取服务器当前日期"""
+    try:
+        today = datetime.now().date()
+        return {
+            "date": today.isoformat(),
+            "weekday": today.weekday(),
+            "weekday_str": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][today.weekday()]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/api/query-trading-date")
+async def get_query_trading_date_api():
+    """获取查询首板数据时应该使用的交易日
+    
+    业务规则：
+    - 9:15（开盘时间）前查上一交易日
+    - 9:15及之后：如果当天是交易日，返回当天；否则返回最新交易日
+    
+    Returns:
+        应该查询的交易日期字符串（格式：YYYY-MM-DD）
+    """
+    try:
+        return {"date": get_query_trading_date()}
+    except Exception as e:
+        logger.error(f"获取查询交易日失败: {e}", exc_info=True)
+        return {"error": str(e)}
+
+@app.get("/api/recent-days")
+async def get_recent_days(limit: int = 5):
+    """获取最近N个交易日"""
+    try:
+        # 使用应该展示的交易日期作为基准（凌晨时为上一个交易日）
+        display_trade_date = get_display_trade_date(query_existing_data=False)
+        recent_trading_dates = get_recent_trading_days(limit, display_trade_date)
+
+        return {"dates": recent_trading_dates, "count": len(recent_trading_dates)}
+    except Exception as e:
+        logger.error(f"获取最近日期失败: {e}", exc_info=True)
+        return {"error": str(e), "dates": []}
+
+@app.get("/api/rotation-records-by-date")
+async def get_rotation_records_by_date(date: str):
+    """根据日期查询题材记录"""
+    try:
+        # 验证日期格式
+        try:
+            date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            return {"error": "Invalid date format, use YYYY-MM-DD", "date": date, "records": []}
+
+        records = db.get_records_by_date(date_obj.isoformat())
+
+        # 确保返回的记录中包含正确的日期信息
+        for record in records:
+            if 'date' not in record:
+                record['date'] = date_obj.isoformat()
+
+        # 计算相对天数（用于显示，但不作为查询依据）
+        today = datetime.now().date()
+        day_diff = (date_obj - today).days
+
+        # 生成日期标签
+        if day_diff == 0:
+            date_label = "今日"
+        elif day_diff == -1:
+            date_label = "昨日"
+        else:
+            date_label = date_obj.strftime("%m-%d")
+
+        return {
+            "date": date_obj.isoformat(),
+            "day": day_diff,  # 仅用于显示
+            "date_label": date_label,
+            "records": records,
+            "count": len(records)
+        }
+    except Exception as e:
+        logger.error(f"按日期获取题材记录失败: {e}", exc_info=True)
+        return {"error": str(e), "date": date, "records": []}
+
+@app.get("/api/next-trading-day")
+async def get_next_trading_day(date: str):
+    """获取指定日期之后的下一个交易日"""
+    try:
+        from datetime import timedelta
+
+        # 验证日期格式
+        try:
+            current_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            return {"error": "Invalid date format, use YYYY-MM-DD"}
+
+        # 向后查找交易日（最多查找20天）
+        for i in range(1, 21):
+            next_date = current_date + timedelta(days=i)
+            if next_date.weekday() >= 5:  # 跳过周末
+                continue
+
+            # 检查数据库是否有数据
+            conn = db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM rotation_actives
+                WHERE date = ? AND content IS NOT NULL AND content != ''
+            ''', (next_date.isoformat(),))
+            count = cursor.fetchone()[0]
+            conn.close()
+
+            # 如果有数据，返回此日期
+            if count > 0:
+                return {
+                    "date": next_date.isoformat(),
+                    "weekday": next_date.weekday(),
+                    "weekday_str": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][next_date.weekday()]
+                }
+
+        # 如果找到最后都没有数据，返回最后一个工作日
+        for i in range(1, 21):
+            next_date = current_date + timedelta(days=i)
+            if next_date.weekday() < 5:
+                return {
+                    "date": next_date.isoformat(),
+                    "weekday": next_date.weekday(),
+                    "weekday_str": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][next_date.weekday()]
+                }
+
+        return {"error": "No trading day found"}, {"date": None}
+
+    except Exception as e:
+        logger.error(f"获取下一个交易日失败: {e}", exc_info=True)
+        return {"error": str(e), "date": None}
+
+@app.get("/api/prev-trading-day")
+async def get_prev_trading_day(date: str):
+    """获取指定日期之前的上一个交易日"""
+    try:
+        from datetime import timedelta
+
+        # 验证日期格式
+        try:
+            current_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            return {"error": "Invalid date format, use YYYY-MM-DD"}
+
+        # 向前查找交易日（最多查找20天）
+        for i in range(1, 21):
+            prev_date = current_date - timedelta(days=i)
+            if prev_date.weekday() >= 5:  # 跳过周末
+                continue
+
+            # 检查数据库是否有数据
+            conn = db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM rotation_actives
+                WHERE date = ? AND content IS NOT NULL AND content != ''
+            ''', (prev_date.isoformat(),))
+            count = cursor.fetchone()[0]
+            conn.close()
+
+            # 如果有数据，返回此日期
+            if count > 0:
+                return {
+                    "date": prev_date.isoformat(),
+                    "weekday": prev_date.weekday(),
+                    "weekday_str": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][prev_date.weekday()]
+                }
+
+        # 如果找到最后都没有数据，返回最后一个工作日
+        for i in range(1, 21):
+            prev_date = current_date - timedelta(days=i)
+            if prev_date.weekday() < 5:
+                return {
+                    "date": prev_date.isoformat(),
+                    "weekday": prev_date.weekday(),
+                    "weekday_str": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][prev_date.weekday()]
+                }
+
+        return {"error": "No trading day found", "date": None}
+
+    except Exception as e:
+        logger.error(f"获取上一个交易日失败: {e}", exc_info=True)
+        return {"error": str(e), "date": None}
+
+@app.get("/api/init-today-if-needed")
+async def init_today_if_needed():
+    """如果是交易日且数据库没有数据，则初始化今天的记录"""
+    try:
+        today = datetime.now().date()
+
+        # 检查是否是工作日
+        if today.weekday() >= 5:  # 周六或周日
+            return {
+                "initialized": False,
+                "reason": "Not a trading day",
+                "today": today.isoformat()
+            }
+
+        # 检查是否已有数据
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*)
+            FROM rotation_actives
+            WHERE date = ?
+        ''', (today.isoformat(),))
+        count = cursor.fetchone()[0]
+        conn.close()
+
+        if count > 0:
+            return {
+                "initialized": False,
+                "reason": "Already has data",
+                "today": today.isoformat(),
+                "record_count": count
+            }
+
+        # 如果没有数据，需要初始化（这里只是告知，不实际创建）
+        return {
+            "initialized": False,
+            "needs_init": True,
+            "reason": "Trading day but no data",
+            "today": today.isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"检查今天数据失败: {e}", exc_info=True)
+        return {
+            "error": str(e),
+            "initialized": False
+        }
+
+@app.post("/api/add-first-limit-to-topic")
+async def add_first_limit_to_topic(data: Dict = Body(...)):
+    """将首板关联到题材
+
+    首板板块API（重要！）：
+    - 使用 stock_id 而非 first_limit_id，确保数据刷新后关联关系不被破坏
+    - 优先使用前端传递的 queryDate，否则使用 get_query_trading_date() 获取当前查看的交易日期
+    - association_date 必须与当前查看的交易日一致，确保数据正确性
+    - create_time：用户操作时间（如周日操作，记录周日时间戳）
+    - association_date：该首板与题材的真实活跃交易日（应等于当前查看的交易日）
+
+    全局交易日规则：
+    - 9:15（开盘时间）前：查看并操作上一个交易日
+    - 9:15及之后：查看并操作当天（如果是交易日）
+    - 如果当前不是交易日：查看并操作上一个交易日
+
+    日期选择功能：
+    - queryDate：前端日期选择器选中的交易日（格式：YYYY-MM-DD）
+    - 支持：用户可以查看和修改历史交易日的数据
+
+    Stock_ID 迁移说明：
+    - 参数已从 first_limit_id 迁移到 stock_id
+    - stock_id 是稳定的，不会因数据刷新而改变
+    - 避免了孤儿引用问题
+    
+    全局交易日规则：
+    - 9:15（开盘时间）前：查看并操作上一个交易日
+    - 9:15及之后：查看并操作当天（如果是交易日）
+    - 如果当前不是交易日：查看并操作上一个交易日
+
+    日期选择功能：
+    - queryDate：前端日期选择器选中的交易日（格式：YYYY-MM-DD）
+    - 支持：用户可以查看和修改历史交易日的数据
+    """
+    try:
+        stock_id = data.get('stock_id')
+        topic_id = data.get('topic_id')
+        date = data.get('date')
+        query_date = data.get('queryDate')  # 前端传递的查询日期
+
+        if not stock_id or not topic_id:
+            return {"success": False, "message": "缺少必要参数"}
+
+        # 优先使用前端传递的 queryDate，否则使用 get_query_trading_date() 获取正确的交易日（当前查看的交易日）
+        # 确保关联日期与当前查看的交易日一致
+        correct_association_date = query_date if query_date else get_query_trading_date()
+        logger.info(f"关联首板到题材: stock_id={stock_id}, topic_id={topic_id}, association_date={correct_association_date}")
+
+        success = db.add_first_limit_to_topic(stock_id, topic_id, date, correct_association_date)
+
+        if success:
+            return {"success": True, "message": "关联成功"}
+        else:
+            return {"success": False, "message": "关联失败"}
+    except Exception as e:
+        logger.error(f"添加首板-题材关联失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+@app.get("/api/first-limit-topics")
+async def get_first_limit_topics(first_limit_id: int):
+    """获取首板关联的题材列表
+    
+    注意：此API使用 first_limit_id 作为查询参数
+    Stock_ID 迁移说明：
+    - 此API尚未迁移到 stock_id
+    - 如需迁移，应改为接收 stock_id 参数
+    - 或考虑废弃此API（前端目前未使用）
+    """
+    try:
+        topics = db.get_first_limit_topics(first_limit_id)
+        return {"topics": topics}
+    except Exception as e:
+        logger.error(f"获取首板题材列表失败: {e}", exc_info=True)
+        return {"error": str(e), "topics": []}
+
+@app.post("/api/remove-first-limit-topic")
+async def remove_first_limit_topic(data: Dict = Body(...)):
+    """移除首板-题材关联
+
+    首板板块API（重要！）：
+    - 优先使用前端传递的 queryDate，否则使用 get_query_trading_date() 获取当前查看的交易日期（开盘后应查看的交易日）
+    - 删除 first_limit_topics 表中该日期的记录（按 association_date 过滤）
+    - 根据前端参数决定是否删除 topic_stock_relations 表中的长期关联
+
+    参数说明：
+    - stock_id: 股票ID（已从 first_limit_id 迁移）
+    - topic_id: 题材ID
+    - remove_relation: 是否删除长期关联（默认false，不删除）
+    - queryDate: 前端传递的查询日期（格式：YYYY-MM-DD）
+
+    全局交易日规则：
+    - 9:15（开盘时间）前：查看并操作上一个交易日
+    - 9:15及之后：查看并操作当天（如果是交易日）
+    - 如果当前不是交易日：查看并操作上一个交易日
+
+    日期选择功能：
+    - queryDate：前端日期选择器选中的交易日（格式：YYYY-MM-DD）
+    - 支持：用户可以查看和修改历史交易日的数据
+    """
+    try:
+        stock_id = data.get('stock_id')
+        topic_id = data.get('topic_id')
+        remove_relation = data.get('remove_relation', False)  # 默认不删除长期关联
+        query_date = data.get('queryDate')  # 前端传递的查询日期
+
+        if not stock_id or not topic_id:
+            return {"success": False, "message": "缺少必要参数"}
+
+        # 优先使用前端传递的 queryDate，否则使用 get_query_trading_date() 获取正确的交易日（当前查看的交易日）
+        correct_association_date = query_date if query_date else get_query_trading_date()
+        logger.info(f"移除首板-题材关联: stock_id={stock_id}, topic_id={topic_id}, association_date={correct_association_date}, remove_relation={remove_relation}")
+
+        # 删除 first_limit_topics 记录
+        success = db.remove_first_limit_topic(stock_id, topic_id, correct_association_date)
+
+        # 如果用户选择删除长期关联，删除 topic_stock_relations 记录
+        if success and remove_relation:
+            logger.info(f"同时删除长期关联: topic_id={topic_id}, stock_id={stock_id}")
+            db.remove_topic_stock_relation(topic_id, stock_id)
+
+        if success:
+            return {"success": True, "message": "移除成功"}
+        else:
+            return {"success": False, "message": "移除失败"}
+    except Exception as e:
+        logger.error(f"移除首板-题材关联失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
+# ============= 交易日相关API接口 =============
+
+@app.post("/api/trading-days/init")
+async def init_trading_days():
+    """初始化交易日数据（从AkShare获取并保存最近3年的交易日）"""
+    try:
+        saved_count, trading_days = fetch_and_save_trading_days()
+
+        if saved_count > 0:
+            logger.info(f"初始化交易日成功，保存了 {saved_count} 个交易日")
+            return {
+                "success": True,
+                "message": f"成功保存 {saved_count} 个交易日",
+                "trading_days_count": saved_count,
+                "first_day": trading_days[0] if trading_days else None,
+                "last_day": trading_days[-1] if trading_days else None
+            }
+        else:
+            logger.warning("初始化交易日失败，没有保存任何交易日")
+            return {
+                "success": False,
+                "message": "未能保存任何交易日，可能已存在或数据源异常"
+            }
+    except Exception as e:
+        logger.error(f"初始化交易日失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/api/trading-days/recent")
+async def get_recent_trading_days_api(count: int = 5):
+    """获取最近N个交易日
+
+    Args:
+        count: 获取的交易日数量，默认为5
+    """
+    try:
+        recent_days = get_recent_trading_days(count)
+
+        return {
+            "success": True,
+            "count": len(recent_days),
+            "trading_days": recent_days
+        }
+    except Exception as e:
+        logger.error(f"获取最近交易日失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "trading_days": []}
+
+
+@app.post("/api/trading-days/ensure")
+async def ensure_trading_day_exists_api(data: Dict = Body(...)):
+    """确保指定交易日存在（如果不存在则添加）
+
+    Args:
+        data: {"date": "YYYY-MM-DD"}
+    """
+    try:
+        date_str = data.get('date')
+
+        if not date_str:
+            return {"success": False, "message": "日期参数不能为空"}
+
+        # 验证日期格式
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return {"success": False, "message": "日期格式不正确，请使用 YYYY-MM-DD 格式"}
+
+        success = ensure_trading_day_exists(date_str)
+
+        if success:
+            return {"success": True, "message": f"交易日 {date_str} 已存在或成功添加"}
+        else:
+            return {"success": False, "message": "确保交易日存在失败"}
+    except Exception as e:
+        logger.error(f"确保交易日存在失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/api/trading-days/between")
+async def get_trading_days_between_api(start_date: str, end_date: str):
+    """获取两个日期之间的所有交易日
+
+    Args:
+        start_date: 开始日期（格式：YYYY-MM-DD）
+        end_date: 结束日期（格式：YYYY-MM-DD）
+    """
+    try:
+        # 验证日期格式
+        try:
+            datetime.strptime(start_date, "%Y-%m-%d")
+            datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError as e:
+            return {"success": False, "message": f"日期格式不正确: {str(e)}"}
+
+        trading_days = get_trading_days_between(start_date, end_date)
+
+        return {
+            "success": True,
+            "count": len(trading_days),
+            "start_date": start_date,
+            "end_date": end_date,
+            "trading_days": trading_days
+        }
+    except Exception as e:
+        logger.error(f"获取日期范围内的交易日失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "trading_days": []}
+
+
+@app.get("/api/trading-days/status")
+async def get_trading_days_status():
+    """获取交易日表的状态信息"""
+    try:
+        conn = db._get_connection()
+        cursor = conn.cursor()
+
+        # 统计记录数
+        cursor.execute('SELECT COUNT(*) FROM trading_days')
+        total_count = cursor.fetchone()[0]
+
+        # 获取最早和最晚的日期
+        cursor.execute('SELECT MIN(date), MAX(date) FROM trading_days')
+        min_date, max_date = cursor.fetchone()
+
+        # 获取最新的记录
+        cursor.execute('SELECT date FROM trading_days ORDER BY date DESC LIMIT 5')
+        recent_dates = [row[0] for row in cursor.fetchall()]
+
+        conn.close()
+
+        return {
+            "success": True,
+            "status": {
+                "total_count": total_count,
+                "min_date": min_date,
+                "max_date": max_date,
+                "recent_dates": recent_dates
+            }
+        }
+    except Exception as e:
+        logger.error(f"获取交易日状态失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+@app.get("/api/trading-days/all-available")
+async def get_all_trading_days_before_today_api():
+    """获取今天之前的所有交易日（用于日期选择器）
+
+    今日首板板块API（重要！）：
+    - 只返回今天及以前的交易日
+    - 过滤掉未来日期（trading_days 表可能包含未来的交易日）
+    - 按日期降序返回（最新的日期在前）
+
+    Returns:
+        {
+            "success": true,
+            "count": 100,
+            "trading_days": ["2026-02-03", "2026-02-02", "2026-01-30", ...]
+        }
+    """
+    try:
+        trading_days = db.get_all_trading_days_before_today()
+
+        return {
+            "success": True,
+            "count": len(trading_days),
+            "trading_days": trading_days
+        }
+    except Exception as e:
+        logger.error(f"获取交易日列表失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "trading_days": []}
+
+@app.get("/api/dashboard-dates-status")
+async def get_dashboard_dates_status():
+    """获取仪表盘日期数据状态（用于标记日历）
+
+    今日首板板块：
+    - 返回所有有题材激活或首板数据的日期
+    - 用于日历中标记哪些日期有数据
+    - 返回格式：dates = {"2026-02-03": true, "2026-02-02": true, ...}
+    """
+    try:
+        date_data = {}
+        
+        # 获取有题材激活的日期
+        try:
+            conn = db._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT DISTINCT activation_date
+                FROM topic_activations
+                ORDER BY activation_date DESC
+            ''')
+            activation_dates = [row[0] for row in cursor.fetchall()]
+            
+            for date in activation_dates:
+                date_data[date] = True
+            
+            conn.close()
+        except Exception as e:
+            logger.warning(f"获取题材激活日期失败: {e}")
+        
+        # 获取有首板数据的日期
+        try:
+            conn = db._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT DISTINCT limit_date
+                FROM first_limits
+                ORDER BY limit_date DESC
+            ''')
+            first_limit_dates = [row[0] for row in cursor.fetchall()]
+            
+            for date in first_limit_dates:
+                date_data[date] = True
+            
+            conn.close()
+        except Exception as e:
+            logger.warning(f"获取首板数据日期失败: {e}")
+
+        return {
+            "success": True,
+            "count": len(date_data),
+            "dates": date_data
+        }
+    except Exception as e:
+        logger.error(f"获取仪表盘日期状态失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "dates": {}}
+
+
+# 【已注释】人气榜相关API endpoints - 包含"人气、热度"相关的数据源管理
+# 关联关系：
+# - 前端调用：createPopularitySource() -> POST /api/popularity-sources/create (dashboard.html:5214)
+# - 前端调用：deletePopularitySource() -> DELETE /api/popularity-sources/{source_id} (dashboard.html:5237)
+# - 数据库操作：db_operations.get_popularity_sources() 等方法
+# - 数据获取：data_acquisition.fetch_and_save_popularity_ranking() 调用 POST /api/popularity-stocks/save
+# 注释原因：暂时隐藏人气榜功能，方便后期恢复
+"""
+@app.get("/api/popularity-sources")
+async def get_popularity_sources():
+    # 获取所有人气榜数据源（选项卡）
+    try:
+        sources = db.get_popularity_sources()
+        return {"success": True, "sources": sources}
+    except Exception as e:
+        logger.error(f"获取人气榜数据源失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "sources": []}
+
+
+@app.post("/api/popularity-sources/create")
+async def create_popularity_source(data: Dict = Body(...)):
+    # 创建人气榜数据源（选项卡）
+    try:
+        source_name = data.get('source_name', '')
+        description = data.get('description', '')
+        sort_order = data.get('sort_order', 0)
+
+        if not source_name:
+            return {"success": False, "message": "数据源名称不能为空"}
+
+        source_id = db.create_popularity_source(source_name, description, sort_order)
+
+        if source_id:
+            return {"success": True, "message": "创建成功", "source_id": source_id}
+        else:
+            return {"success": False, "message": "创建失败"}
+    except Exception as e:
+        logger.error(f"创建人气榜数据源失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/popularity-sources/update")
+async def update_popularity_source(data: Dict = Body(...)):
+    # 更新人气榜数据源
+    try:
+        source_id = data.get('source_id')
+        source_name = data.get('source_name')
+        description = data.get('description')
+        sort_order = data.get('sort_order')
+        is_active = data.get('is_active')
+
+        if not source_id:
+            return {"success": False, "message": "数据源ID不能为空"}
+
+        success = db.update_popularity_source(source_id, source_name, description, sort_order, is_active)
+
+        if success:
+            return {"success": True, "message": "更新成功"}
+        else:
+            return {"success": False, "message": "更新失败"}
+    except Exception as e:
+        logger.error(f"更新人气榜数据源失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
+@app.delete("/api/popularity-sources/{source_id}")
+async def delete_popularity_source(source_id: int):
+    # 删除人气榜数据源（级联删除其下的所有标的记录）
+    try:
+        success = db.delete_popularity_source(source_id)
+
+        if success:
+            return {"success": True, "message": "删除成功"}
+        else:
+            return {"success": False, "message": "删除失败"}
+    except Exception as e:
+        logger.error(f"删除人气榜数据源失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/api/popularity-stocks")
+async def get_popularity_stocks(source_id: int, trade_date: str):
+    # 获取指定数据源和交易日的人气榜标的
+    try:
+        stocks = db.get_popularity_stocks(source_id, trade_date)
+        return {"success": True, "stocks": stocks}
+    except Exception as e:
+        logger.error(f"获取人气榜标的失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "stocks": []}
+
+
+@app.post("/api/popularity-stocks/save")
+async def save_popularity_stocks(data: Dict = Body(...)):
+    # 保存人气榜标的数据
+    try:
+        source_id = data.get('source_id')
+        trade_date = data.get('trade_date')
+        stocks = data.get('stocks', [])
+
+        if not source_id or not trade_date:
+            return {"success": False, "message": "数据源ID和交易日期不能为空"}
+
+        count = db.save_popularity_stocks(source_id, trade_date, stocks)
+
+        return {"success": True, "message": f"保存成功，共 {count} 条", "count": count}
+    except Exception as e:
+        logger.error(f"保存人气榜标的失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+"""
+
+
+@app.get("/api/amount-types")
+async def get_amount_types():
+    """获取所有成交额榜类型（选项卡）"""
+    try:
+        types = db.get_amount_types()
+        return {"success": True, "types": types}
+    except Exception as e:
+        logger.error(f"获取成交额榜类型失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "types": []}
+
+
+@app.get("/api/amount-stocks")
+async def get_amount_stocks(type_id: int, trade_date: str):
+    """获取指定类型和交易日的成交额榜标的"""
+    try:
+        stocks = db.get_amount_stocks(type_id, trade_date)
+        return {"success": True, "stocks": stocks}
+    except Exception as e:
+        logger.error(f"获取成交额榜标的失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "stocks": []}
+
+
+@app.post("/api/amount-stocks/save")
+async def save_amount_stocks(data: Dict = Body(...)):
+    """保存成交额榜标的数据"""
+    try:
+        type_id = data.get('type_id')
+        trade_date = data.get('trade_date')
+        stocks = data.get('stocks', [])
+        check_final = data.get('check_final', True)
+
+        if not type_id or not trade_date:
+            return {"success": False, "message": "类型ID和交易日期不能为空"}
+
+        count = db.save_amount_stocks(type_id, trade_date, stocks, check_final)
+
+        if count == 0 and check_final:
+            return {"success": False, "message": "数据已标记为final，不可修改"}
+        else:
+            return {"success": True, "message": f"保存成功，共 {count} 条", "count": count}
+    except Exception as e:
+        logger.error(f"保存成交额榜标的失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/amount-stocks/finalize")
+async def finalize_amount_stocks(data: Dict = Body(...)):
+    """将成交额榜数据标记为final（不可修改）"""
+    try:
+        type_id = data.get('type_id')
+        trade_date = data.get('trade_date')
+
+        if not type_id or not trade_date:
+            return {"success": False, "message": "类型ID和交易日期不能为空"}
+
+        success = db.set_amount_stocks_final(type_id, trade_date)
+
+        if success:
+            return {"success": True, "message": "标记成功"}
+        else:
+            return {"success": False, "message": "标记失败"}
+    except Exception as e:
+        logger.error(f"标记成交额榜为final失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/api/sector-high-count")
+async def get_sector_high_count(date: str = None, onlyHistoryHigh: bool = False):
+    """板块新高数量 - 统计各个行业今天新高的股票数量
+
+    Args:
+        date: 查询日期
+        onlyHistoryHigh: True仅统计历史新高，False统计所有新高（半年、一年、历史）
+    """
+    try:
+        conn = db._get_connection()
+        cursor = conn.cursor()
+
+        query_date = date if date else get_display_trade_date()
+
+        if onlyHistoryHigh:
+            # 仅统计历史新高
+            source_filter = "('历史新高')"
+        else:
+            # 统计所有新高（半年、一年、历史）
+            source_filter = "('半年新高', '一年新高', '历史新高')"
+
+        cursor.execute(f'''
+            SELECT 
+                s.industry as industry_name,
+                COUNT(DISTINCT ps.stock_id) as count
+            FROM popularity_stocks ps
+            JOIN stocks s ON ps.stock_id = s.stock_id
+            JOIN popularity_sources psrc ON ps.source_id = psrc.source_id
+            WHERE ps.trade_date = ?
+            AND psrc.source_name IN {source_filter}
+            AND (s.industry IS NOT NULL AND s.industry != '')
+            GROUP BY s.industry
+            ORDER BY count DESC
+        ''', (query_date,))
+
+        sectors = []
+        for row in cursor.fetchall():
+            sectors.append({
+                'industry_name': row[0],
+                'count': row[1]
+            })
+
+        conn.close()
+
+        return {"success": True, "sectors": sectors, "date": query_date, "onlyHistoryHigh": onlyHistoryHigh}
+    except Exception as e:
+        logger.error(f"获取板块新高数量失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "sectors": []}
+
+
+@app.get("/api/sector-high-stocks")
+async def get_sector_high_stocks(date: str = None, onlyHistoryHigh: bool = False, industry: str = None):
+    """板块新高股票列表 - 获取指定板块的新高股票列表
+
+    Args:
+        date: 查询日期
+        onlyHistoryHigh: True仅统计历史新高，False统计所有新高（半年、一年、历史）
+        industry: 板块名称
+    """
+    try:
+        conn = db._get_connection()
+        cursor = conn.cursor()
+
+        query_date = date if date else get_display_trade_date()
+
+        if onlyHistoryHigh:
+            # 仅统计历史新高
+            source_filter = "('历史新高')"
+        else:
+            # 统计所有新高（半年、一年、历史）
+            source_filter = "('半年新高', '一年新高', '历史新高')"
+
+        industry_filter = f"AND s.industry = ?" if industry else ""
+
+        cursor.execute(f'''
+            SELECT 
+                s.stock_code,
+                s.stock_name,
+                ps.change_percent
+            FROM popularity_stocks ps
+            JOIN stocks s ON ps.stock_id = s.stock_id
+            JOIN popularity_sources psrc ON ps.source_id = psrc.source_id
+            WHERE ps.trade_date = ?
+            AND psrc.source_name IN {source_filter}
+            AND (s.industry IS NOT NULL AND s.industry != '')
+            {industry_filter}
+            ORDER BY ps.change_percent DESC
+        ''', (query_date, *([industry] if industry else [])))
+
+        stocks = []
+        for row in cursor.fetchall():
+            stocks.append({
+                'code': row[0],
+                'name': row[1],
+                'change_percent': row[2]
+            })
+
+        conn.close()
+
+        return {"success": True, "stocks": stocks, "date": query_date, "industry": industry}
+    except Exception as e:
+        logger.error(f"获取板块新高股票列表失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "stocks": []}
+
+
+@app.get("/api/hot-stocks")
+async def get_hot_stocks_data(queryDate: str = None):
+    """
+    获取标的热度板块数据（支持日期选择器）
+
+    日期规则：
+    - 9:15之前：显示上一个交易日的数据（人气榜、全天成交额未更新，竞价成交额未开始）
+    - 9:15之后：显示当前交易日的数据
+
+    Args:
+        queryDate: 查询日期（格式：YYYY-MM-DD），可选
+    """
+    try:
+        now = datetime.now()
+        current_date = now.date().strftime("%Y-%m-%d")
+        current_time = now.time()
+        market_open_time = time(9, 15)
+
+        # 获取最新交易日
+        latest_trading_date = get_latest_trading_date_from_db()
+        if not latest_trading_date:
+            latest_trading_date = get_last_trading_day()
+
+        trade_date = None
+
+        if queryDate:
+            # 用户手动选择的日期
+            trade_date = queryDate
+        else:
+            # 自动选择日期
+            # 9:15之前显示上一个交易日
+            if current_time < market_open_time:
+                # 查询今天之前的最新交易日
+                conn = db._get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT MAX(date)
+                    FROM trading_days
+                    WHERE date < ? AND is_active = 1
+                ''', (current_date,))
+                result = cursor.fetchone()
+                conn.close()
+
+                if result and result[0]:
+                    trade_date = result[0]
+                else:
+                    trade_date = latest_trading_date
+            else:
+                from src.db_operations import is_trading_day
+                if is_trading_day(current_date):
+                    trade_date = current_date
+                else:
+                    trade_date = latest_trading_date
+
+        # 返回标的热度数据
+        result = await StockDataService().get_stock_popularity_data(trade_date)
+        return result
+
+    except Exception as e:
+        logger.error(f"获取标的热度数据失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "trade_date": None, "popularity_sources": [], "popularity_data": [], "amount_types": [], "amount_data": []}
+
+
+@app.post("/api/hot-stocks/refresh")
+async def refresh_hot_stocks_data(targetDate: str = Body(..., embed=True, description="要刷新的目标日期")):
+    # 【已注释完整文档说明】手动刷新标的热度数据（用户主动触发）
+    # 当用户点击刷新按钮时调用此API，
+    # 会使用用户通过日期选择器选择的日期获取标的热度数据并保存到数据库
+    #
+    # 日期规则：
+    # 1. 竞价成交额：仅在交易日的9:15~9:30之间可刷新
+    # 2. 全天成交额：仅在交易日的15:00后可刷新（往期数据随时可刷新）
+    # 3. 【已注释】人气榜：仅在交易日的15:00后可刷新（往期数据随时可刷新）
+    #
+    # Args:
+    #     targetDate: 用户通过日期选择器选择的目标日期（格式：YYYY-MM-DD）
+    try:
+        from src.data_acquisition import DataAcquisitionService
+        from datetime import datetime, time
+
+        logger.info("手动刷新标的热度数据开始")
+        logger.info(f"用户选择的刷新日期: {targetDate}")
+
+        now = datetime.now()
+        current_time = now.time()
+        current_date = now.strftime("%Y-%m-%d")
+        auction_start = time(9, 15)
+        auction_end = time(9, 30)
+        market_close = time(15, 0)
+
+        from src.db_operations import is_trading_day
+        target_is_trading_day = is_trading_day(targetDate)
+        today_is_trading_day = is_trading_day(current_date)
+        is_today = targetDate == current_date
+
+        service = DataAcquisitionService()
+
+        results = {
+            "success": True,
+            "message": "",
+            "target_date": targetDate,
+            "auction_amount": {"success": False, "message": "", "count": 0},
+            "full_day_amount": {"success": False, "message": "", "count": 0},
+            "popularity_data": {}
+        }
+
+        if is_today and target_is_trading_day:
+            if auction_start <= current_time <= auction_end:
+                amount_result = service.fetch_and_save_amount_ranking("竞价成交额", targetDate)
+                results["auction_amount"]["success"] = amount_result.get("success", False)
+                results["auction_amount"]["message"] = amount_result.get("message", "")
+                results["auction_amount"]["count"] = amount_result.get("record_count", 0)
+            else:
+                if current_time > auction_end:
+                    results["auction_amount"]["message"] = "竞价数据仅在9:15-9:30之间可获取，当前已过交易时间"
+                else:
+                    results["auction_amount"]["message"] = "未到竞价数据获取时间（9:15-9:30）"
+        else:
+            results["auction_amount"]["message"] = "往期数据无法刷新竞价成交额"
+
+        if is_today and target_is_trading_day:
+            if current_time >= market_close:
+                amount_result = service.fetch_and_save_amount_ranking("全天成交额", targetDate)
+                results["full_day_amount"]["success"] = amount_result.get("success", False)
+                results["full_day_amount"]["message"] = amount_result.get("message", "")
+                results["full_day_amount"]["count"] = amount_result.get("record_count", 0)
+            else:
+                results["full_day_amount"]["message"] = "全天成交额数据需在15:00后才能刷新"
+        else:
+            amount_result = service.fetch_and_save_amount_ranking("全天成交额", targetDate)
+            results["full_day_amount"]["success"] = amount_result.get("success", False)
+            results["full_day_amount"]["message"] = amount_result.get("message", "")
+            results["full_day_amount"]["count"] = amount_result.get("record_count", 0)
+
+        # 人气榜数据刷新逻辑
+        # 关联关系：
+        # - 调用 db_operations.get_popularity_sources() (line 2253)
+        # - 调用 data_acquisition.fetch_and_save_popularity_ranking() (line 639)
+        # - 保存到 popularity_stocks 表
+        # - 与前端 dashboard.html 的人气榜功能关联
+        # 过滤说明：只处理"新高榜"数据源（半年新高、一年新高、历史新高）
+        popularity_sources = db.get_popularity_sources()
+        allowed_sources = ['半年新高', '一年新高', '历史新高']
+        for source in popularity_sources:
+            source_name = source['source_name']
+            if source_name not in allowed_sources:
+                continue
+
+            if is_today and target_is_trading_day:
+                if current_time >= market_close:
+                    popularity_result = service.fetch_and_save_popularity_ranking(source_name, targetDate)
+                    results["popularity_data"][source_name] = {
+                        "success": popularity_result.get("success", False),
+                        "message": popularity_result.get("message", ""),
+                        "count": popularity_result.get("record_count", 0)
+                    }
+                else:
+                    results["popularity_data"][source_name] = {
+                        "success": False,
+                        "message": "人气榜数据需在15:00后才能刷新",
+                        "count": 0
+                    }
+            else:
+                popularity_result = service.fetch_and_save_popularity_ranking(source_name, targetDate)
+                results["popularity_data"][source_name] = {
+                    "success": popularity_result.get("success", False),
+                    "message": popularity_result.get("message", ""),
+                    "count": popularity_result.get("record_count", 0)
+                }
+
+        success_count = sum(1 for v in results["popularity_data"].values() if v["success"]) if results.get("popularity_data") else 0
+        if results["full_day_amount"]["success"]:
+            success_count += 1
+
+        message_parts = []
+        message_parts.append(f"目标日期: {targetDate}")
+
+        if results["auction_amount"]["success"]:
+            message_parts.append(f"竞价成交额: {results['auction_amount']['count']}条")
+        else:
+            message_parts.append(f"竞价成交额: {results['auction_amount']['message']}")
+
+        if results["full_day_amount"]["success"]:
+            message_parts.append(f"全天成交额: {results['full_day_amount']['count']}条")
+        else:
+            message_parts.append(f"全天成交额: {results['full_day_amount']['message']}")
+
+        # 人气榜消息处理
+        if success_count > 0:
+            message_parts.append(f"人气榜: {success_count}个数据源成功")
+        else:
+            popularity_messages = []
+            for source_name, data in results["popularity_data"].items():
+                if not data["success"]:
+                    popularity_messages.append(f"{source_name}: {data['message']}")
+            if popularity_messages:
+                message_parts.append(f"人气榜: {', '.join(popularity_messages)}")
+
+        results["message"] = "\n".join(message_parts)
+
+        logger.info(f"手动刷新标的热度数据完成: {results}")
+        return results
+
+    except Exception as e:
+        logger.error(f"手动刷新标的热度数据失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 环境配置管理
+class SettingsConfig(BaseModel):
+    mairui_licence: Optional[str] = None
+    mairui_base_url: Optional[str] = None
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """获取环境配置"""
+    try:
+        return {
+            "mairui_licence": os.getenv('MAIRUI_LICENCE', ''),
+            "mairui_base_url": os.getenv('MAIRUI_BASE_URL', 'https://api.mairuiapi.com')
+        }
+    except Exception as e:
+        logger.error(f"获取配置失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取配置失败: {str(e)}")
+
+
+@app.post("/api/settings")
+async def save_settings(config: SettingsConfig):
+    """保存环境配置到.env文件"""
+    try:
+        env_file = '.env'
+        env_lines = []
+
+        # 读取现有的.env文件内容（如果存在）
+        if os.path.exists(env_file):
+            with open(env_file, 'r', encoding='utf-8') as f:
+                env_lines = f.readlines()
+
+        # 创建一个字典来存储当前的配置
+        env_dict = {}
+        for line in env_lines:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                env_dict[key.strip()] = value.strip()
+
+        # 更新配置
+        if config.mairui_licence is not None:
+            env_dict['MAIRUI_LICENCE'] = config.mairui_licence
+        if config.mairui_base_url is not None:
+            env_dict['MAIRUI_BASE_URL'] = config.mairui_base_url
+
+        # 写入.env文件
+        with open(env_file, 'w', encoding='utf-8') as f:
+            for key, value in env_dict.items():
+                f.write(f"{key}={value}\n")
+
+        # 更新当前进程的环境变量
+        if config.mairui_licence is not None:
+            os.environ['MAIRUI_LICENCE'] = config.mairui_licence
+        if config.mairui_base_url is not None:
+            os.environ['MAIRUI_BASE_URL'] = config.mairui_base_url
+
+        logger.info(f"环境配置已保存: MAIRUI_LICENCE={'***' if config.mairui_licence else '未设置'}, MAIRUI_BASE_URL={config.mairui_base_url}")
+
+        return {
+            "success": True,
+            "message": "配置保存成功，重启服务后生效"
+        }
+    except Exception as e:
+        logger.error(f"保存配置失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"保存配置失败: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
