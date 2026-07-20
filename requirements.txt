@@ -9,3 +9,4 @@ pandas
 numpy
 apscheduler>=3.10.0
 tenacity>=8.2.0
+python-dotenv>=1.0.0

@@ -2435,7 +2435,7 @@ async def get_dashboard_data(queryDate: str = None):
 
 @app.get("/")
 async def dashboard(request: Request):
-    return templates.TemplateResponse(request, "dashboard.html")
+    return templates.TemplateResponse("dashboard.html", {"request": request})
 
 @app.get("/health")
 async def health_check():
