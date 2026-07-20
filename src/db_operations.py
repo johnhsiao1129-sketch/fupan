@@ -3,11 +3,14 @@ import logging
 import sqlite3
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
+from pathlib import Path
 import akshare as ak
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "data/fupan.db"
+# DB_PATH 用绝对路径, 避免被 CWD 影响
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = str(_PROJECT_ROOT / "data" / "fupan.db")
 
 
 def is_trading_day(date_str: str) -> bool:

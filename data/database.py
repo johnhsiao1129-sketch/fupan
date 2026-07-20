@@ -2,10 +2,14 @@ import sqlite3
 from datetime import datetime, timedelta
 import os
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "data/fupan.db"
+# DB_PATH 用绝对路径, 避免被 CWD 影响
+# (旧版用 "data/fupan.db" 相对路径, 在 CWD 不是项目根时会创建空 DB 到错误位置)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = str(_PROJECT_ROOT / "data" / "fupan.db")
 
 MARKET_MOOD_MAP = {
     1: "低迷",
