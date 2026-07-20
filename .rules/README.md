@@ -4,6 +4,13 @@
 
 ## 规则文件列表
 
+### architecture-design.md
+架构设计规则，包括：
+- 避免过度耦合
+- 单一职责原则
+- 模块化设计
+- 代码复用原则
+
 ### frontend-development.md
 前端开发规则，包括：
 - CSS 开发规范
@@ -22,7 +29,7 @@
 ## 添加新规则
 
 当遇到值得记录的问题或经验时：
-1. 在 `frontend-development.md` 或相应的规则文件中添加新章节
+1. 在对应的规则文件中添加新章节（如`architecture-design.md`或`frontend-development.md`）
 2. 描述问题现象、根本原因、解决方案
 3. 提供代码示例（错误代码和正确代码）
 4. 更新检查清单
@@ -33,4 +40,4 @@ AI 助手和项目开发者
 
 ## 最后更新
 
-2026-03-11
+2026-03-12 - 添加 `architecture-design.md` (架构设计规则)

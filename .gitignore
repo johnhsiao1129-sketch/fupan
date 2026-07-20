@@ -40,16 +40,20 @@ Thumbs.db
 
 # 敏感配置
 .env
+.env.1
 .env.local
 *.key
 *.pem
 credentials.json
 
-# 数据文件
+# 数据文件 (运行时生成)
 data/*.json
+data/cache/
 !data/.gitkeep
 data/*.db
-!data/fupan.db  # 允许提交主数据库文件（公开的大A数据）
+data/form.xlsx
+data/*.xlsx
+data/*.docx
 
 # 日志
 *.log
@@ -57,7 +61,24 @@ data/*.db
 # 临时文件
 *.tmp
 *.temp
+*.bak
+*.bak2
 
-# 备份文件
+# 项目备份目录 (代码靠 git, 数据库靠 backup_project.py)
+backup/
 backup_*.html
 backup_*/
+
+# 历史脚本/设计文件 (一次性, 不应入 git)
+pencil*.pen
+_to_delete/
+
+# AI/编辑器内部状态
+.opencodeignore*
+.opencodeignore.minimal
+.mindscape/
+.omo/
+.anything-graph/
+.graph.db
+.graph.db-shm
+.graph.db-wal

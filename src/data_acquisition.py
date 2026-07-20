@@ -6,6 +6,7 @@ import akshare as ak
 import pandas as pd
 import logging
 import json
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from data.database import DB_PATH
@@ -17,9 +18,67 @@ import requests
 logger = logging.getLogger(__name__)
 
 # 加载 Mairui API 配置（全局，避免重复加载）
-load_dotenv()
+load_dotenv('.env.1')
 MAIRUI_LICENCE = os.getenv('MAIRUI_LICENCE')
 MAIRUI_BASE_URL = os.getenv('MAIRUI_BASE_URL', 'https://api.mairuiapi.com')
+MAIRUI_STRONG_API_URL = os.getenv('MAIRUI_STRONG_API_URL', 'hslt/qsgc')
+
+# Mairui API 调用统计
+_mairui_api_stats = {
+    'used': 0,
+    'limit': 50,
+    'date': datetime.now().date()
+}
+
+def get_mairui_api_stats():
+    """获取 Mairui API 调用统计"""
+    today = datetime.now().date()
+    if _mairui_api_stats['date'] != today:
+        _mairui_api_stats['used'] = 0
+        _mairui_api_stats['date'] = today
+    return {
+        'used': _mairui_api_stats['used'],
+        'limit': _mairui_api_stats['limit'],
+        'date': _mairui_api_stats['date'].isoformat()
+    }
+
+def increment_mairui_api_usage(count: int = 1):
+    """增加 Mairui API 调用次数"""
+    today = datetime.now().date()
+    if _mairui_api_stats['date'] != today:
+        _mairui_api_stats['used'] = 0
+        _mairui_api_stats['date'] = today
+    _mairui_api_stats['used'] += count
+
+
+def mairui_get_with_retry(url: str, max_retries: int = 3, timeout: int = 30, retry_delay: float = 2.0):
+    """Mairui API GET 请求带重试 (应对 404/502 不稳定)
+
+    仅在状态码 200 时返回 Response 对象；其他情况 (异常/非200) 触发重试。
+    重试 max_retries 次后仍失败则返回最后一次 Response 对象 (可能仍非 200)。
+    """
+    last_response = None
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code == 200:
+                if attempt > 1:
+                    logger.info(f"  ✓ Mairui 重试 {attempt}/{max_retries} 成功")
+                return r
+            else:
+                logger.warning(f"  Mairui 请求尝试 {attempt}/{max_retries} 失败: HTTP {r.status_code} - {r.text[:80]}")
+                last_response = r
+        except Exception as e:
+            logger.warning(f"  Mairui 请求尝试 {attempt}/{max_retries} 异常: {type(e).__name__}: {str(e)[:80]}")
+            last_error = e
+        if attempt < max_retries:
+            time.sleep(retry_delay)
+    if last_response is not None:
+        return last_response
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 class DataAcquisitionService:
@@ -84,7 +143,7 @@ class DataAcquisitionService:
             if should_close and conn:
                 conn.close()
 
-    def fetch_and_save_limit_data(self, date: str) -> Dict:
+    def fetch_and_save_limit_data(self, date: str, use_tmp_table: bool = False) -> Dict:
         """获取并保存涨停数据（包含首板、连板、统计数据）
 
         数据源配置：
@@ -98,6 +157,9 @@ class DataAcquisitionService:
 
         Args:
             date: 交易日期，格式：YYYY-MM-DD
+            use_tmp_table: 是否使用临时表（True=盘中刷新，False=盘后刷新）
+                             - 盘中刷新时使用临时表
+                             - 盘后刷新时使用正式表
 
         Returns:
             {
@@ -121,7 +183,19 @@ class DataAcquisitionService:
                 "total_records": 0
             }
 
+            # 根据use_tmp_table参数确定使用的表
+            first_limits_table = "first_limits_tmp" if use_tmp_table else "first_limits"
+            first_limit_topics_table = "first_limit_topics_tmp" if use_tmp_table else "first_limit_topics"
+            if use_tmp_table:
+                continuous_limits_table = None
+            else:
+                continuous_limits_table = "continuous_limits_history"
+            limit_down_table = "limit_down_tmp" if use_tmp_table else "limit_down"
+            exploded_table = "exploded_tmp" if use_tmp_table else "exploded"
+            limit_stats_table = "limit_stats_tmp" if use_tmp_table else "limit_stats"
+
             logger.info(f"开始获取 {date} 的涨停数据")
+            logger.info(f"使用临时表: {use_tmp_table}")
 
             # 1. 获取涨停板数据（直接使用当日涨停池）
             df_limit = None
@@ -153,39 +227,45 @@ class DataAcquisitionService:
                 logger.warning(f"错误详情: {type(e).__name__}: {str(e)}")
 
             # 2. 获取跌停板数据（使用 Mairui API）
-            mairui_limit_down_count = 0
-            limit_down_data = []
-
-            if MAIRUI_LICENCE:
-                try:
-                    dt_url = f"{MAIRUI_BASE_URL}/hslt/dtgc/{date}/{MAIRUI_LICENCE}"
-                    logger.info(f"调用 Mairui 跌停接口: {dt_url}")
-                    dt_response = requests.get(dt_url, timeout=30)
-
-                    if dt_response.status_code == 200:
-                        limit_down_data = dt_response.json() if isinstance(dt_response.json(), list) else []
-                        mairui_limit_down_count = len(limit_down_data)
-                        logger.info(f"✓ Mairui 跌停数据获取成功: {mairui_limit_down_count} 只")
-                        if limit_down_data:
-                            logger.info(f"[DEBUG] Mairui 跌停数据字段名: {list(limit_down_data[0].keys()) if limit_down_data else '无数据'}")
-                            logger.info(f"[DEBUG] Mairui 跌停数据样本（前2条）: {json.dumps(limit_down_data[:2], ensure_ascii=False)[:500]}")
-                    else:
-                        logger.warning(f"Mairui 跌停接口错误: {dt_response.status_code}")
-                except Exception as e:
-                    logger.warning(f"获取 Mairui 跌停数据失败: {e}")
+            # 盘中刷新时跳过跌停数据获取，节省API额度
+            if use_tmp_table:
+                logger.info("盘中模式：跳过跌停数据获取")
+                results["limit_down_count"] = 0
             else:
-                logger.warning("Mairui License 未配置")
+                mairui_limit_down_count = 0
+                limit_down_data = []
 
-            results["limit_down_count"] = mairui_limit_down_count
-            if mairui_limit_down_count == 0:
-                logger.info("Mairui 跌停数据未获取到，设置为0")
-            else:
-                # 保存跌停数据到 limit_down 表
-                try:
-                    saved_count = self._save_limit_down_data(limit_down_data, date)
-                    logger.info(f"跌停数据已保存: {saved_count} 条")
-                except Exception as e:
-                    logger.warning(f"保存跌停数据失败: {e}")
+                if MAIRUI_LICENCE:
+                    try:
+                        dt_url = f"{MAIRUI_BASE_URL}/hslt/dtgc/{date}/{MAIRUI_LICENCE}"
+                        logger.info(f"调用 Mairui 跌停接口: {dt_url}")
+                        dt_response = mairui_get_with_retry(dt_url)
+
+                        if dt_response and dt_response.status_code == 200:
+                            increment_mairui_api_usage()
+                            limit_down_data = dt_response.json() if isinstance(dt_response.json(), list) else []
+                            mairui_limit_down_count = len(limit_down_data)
+                            logger.info(f"✓ Mairui 跌停数据获取成功: {mairui_limit_down_count} 只")
+                            if limit_down_data:
+                                logger.info(f"[DEBUG] Mairui 跌停数据字段名: {list(limit_down_data[0].keys()) if limit_down_data else '无数据'}")
+                                logger.info(f"[DEBUG] Mairui 跌停数据样本（前2条）: {json.dumps(limit_down_data[:2], ensure_ascii=False)[:500]}")
+                        else:
+                            logger.warning(f"Mairui 跌停接口最终失败: {dt_response.status_code if dt_response else 'N/A'}")
+                    except Exception as e:
+                        logger.warning(f"获取 Mairui 跌停数据失败: {e}")
+                else:
+                    logger.warning("Mairui License 未配置")
+
+                results["limit_down_count"] = mairui_limit_down_count
+                if mairui_limit_down_count == 0:
+                    logger.info("Mairui 跌停数据未获取到，设置为0")
+                else:
+                    # 保存跌停数据到 limit_down 表
+                    try:
+                        saved_count = self._save_limit_down_data(limit_down_data, date)
+                        logger.info(f"跌停数据已保存: {saved_count} 条")
+                    except Exception as e:
+                        logger.warning(f"保存跌停数据失败: {e}")
 
 
             # 3. 处理涨停板数据并保存到数据库
@@ -310,11 +390,11 @@ class DataAcquisitionService:
             # 先查询已存在的首板记录（用于比较判断是否需要更新或补全）
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute('''
+            cursor.execute(f'''
                 SELECT fl.id, fl.stock_id, fl.limit_date, fl.first_limit_time, fl.limit_price,
                        fl.open_price, fl.amount, fl.reason, fl.limit_type, fl.is_exploded,
                        s.stock_code
-                FROM first_limits fl
+                FROM {first_limits_table} fl
                 JOIN stocks s ON fl.stock_id = s.stock_id
                 WHERE fl.limit_date = ?
             ''', (date,))
@@ -385,7 +465,7 @@ class DataAcquisitionService:
                         if needs_patch or len(update_fields) > 0:
                             # 执行更新或补全
                             if len(update_fields) > 0:
-                                update_sql = f"UPDATE first_limits SET {', '.join(update_fields)}, create_time = ? WHERE id = ?"
+                                update_sql = f"UPDATE {first_limits_table} SET {', '.join(update_fields)}, create_time = ? WHERE id = ?"
                                 update_values = []
                                 for field in update_fields:
                                     key = field.split(' = ')[0].strip()
@@ -409,34 +489,52 @@ class DataAcquisitionService:
                                 cursor.execute(update_sql, update_values)
                             else:
                                 # 只更新时间
-                                cursor.execute('UPDATE first_limits SET create_time = ? WHERE id = ?',
+                                cursor.execute(f'UPDATE {first_limits_table} SET create_time = ? WHERE id = ?',
                                                (datetime.now().isoformat(), existing['id']))
-                            
+
                             updated_count += 1
+                            # 根据真实涨跌幅判断涨停类型
+                            limit_type = '10%'
+                            change_pct = stock_data.get('change_pct', 0)
+                            if change_pct >= 19.5 and change_pct <= 20.5:
+                                limit_type = '20%'
+                            elif change_pct >= 29.5 and change_pct <= 30.5:
+                                limit_type = '30%'
+
                             to_save_first_limits.append((
                                 stock_id, date, stock_data['first_time'], stock_data['price'],
-                                stock_data['amount'], f'首板涨停', stock_data['exploded_count'] > 0, datetime.now().isoformat()
+                                stock_data['amount'], f'首板涨停', stock_data['exploded_count'] > 0, datetime.now().isoformat(), limit_type
                             ))
                         else:
                             # 数据完整且未变化，跳过
                             continue
                     else:
                         # 新记录，插入
+                        # 根据真实涨跌幅判断涨停类型
+                        limit_type = '10%'
+                        change_pct = stock_data.get('change_pct', 0)
+                        if change_pct >= 19.5 and change_pct <= 20.5:
+                            limit_type = '20%'
+                        elif change_pct >= 29.5 and change_pct <= 30.5:
+                            limit_type = '30%'
+
                         to_save_first_limits.append((
                             stock_id, date, stock_data['first_time'], stock_data['price'],
-                            stock_data['amount'], f'首板涨停', stock_data['exploded_count'] > 0, datetime.now().isoformat()
+                            stock_data['amount'], f'首板涨停', stock_data['exploded_count'] > 0, datetime.now().isoformat(), limit_type
                         ))
                         inserted_count += 1
                     
                     first_limit_stocks.append(stock_data['code'])
 
-                # 保存到连板梯队历史表
-                to_save_continuous_limits.append((
-                    date, stock_data['code'], stock_data['name'], stock_data['price'],
-                    stock_data['first_time'], continuous_days, stock_data['sector'],
-                    f'{continuous_days}连板', stock_data['amount'], datetime.now().isoformat()
-                ))
-                continuous_limit_stocks.append(stock_data['code'])
+                # 保存到连板梯队历史表（包括首板和连板）
+                if not use_tmp_table and continuous_days >= 1:
+                    to_save_continuous_limits.append((
+                        date, stock_data['code'], stock_data['name'], stock_data['price'],
+                        stock_data['first_time'], continuous_days, stock_data['sector'],
+                        '首板' if continuous_days == 1 else f'{continuous_days}连板',
+                        stock_data['amount'], datetime.now().isoformat()
+                    ))
+                    continuous_limit_stocks.append(stock_data['code'])
 
             # 批量插入数据
             if to_save_first_limits:
@@ -444,8 +542,8 @@ class DataAcquisitionService:
                 stock_date_pairs = [(item[0], item[1]) for item in to_save_first_limits]
                 old_first_limit_ids = {}
                 for stock_id, limit_date in stock_date_pairs:
-                    cursor.execute('''
-                        SELECT id FROM first_limits
+                    cursor.execute(f'''
+                        SELECT id FROM {first_limits_table}
                         WHERE stock_id = ? AND limit_date = ?
                     ''', (stock_id, limit_date))
                     result = cursor.fetchone()
@@ -453,24 +551,24 @@ class DataAcquisitionService:
                         old_first_limit_ids[(stock_id, limit_date)] = result[0]
 
                 # 执行 INSERT OR REPLACE（会删除旧记录并创建新ID）
-                cursor.executemany('''
-                    INSERT OR REPLACE INTO first_limits
-                    (stock_id, limit_date, first_limit_time, limit_price, amount, reason, is_exploded, source, create_time)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'akshare', ?)
+                cursor.executemany(f'''
+                    INSERT OR REPLACE INTO {first_limits_table}
+                    (stock_id, limit_date, first_limit_time, limit_price, amount, reason, is_exploded, source, create_time, limit_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'akshare', ?, ?)
                 ''', to_save_first_limits)
 
                 # 更新 first_limit_topics 表中的 first_limit_id 为新的ID
                 updated_count = 0
                 for (stock_id, limit_date), old_id in old_first_limit_ids.items():
-                    cursor.execute('''
-                        SELECT id FROM first_limits
+                    cursor.execute(f'''
+                        SELECT id FROM {first_limits_table}
                         WHERE stock_id = ? AND limit_date = ?
                     ''', (stock_id, limit_date))
                     result = cursor.fetchone()
                     if result and result[0] != old_id:
                         new_id = result[0]
-                        cursor.execute('''
-                            UPDATE first_limit_topics
+                        cursor.execute(f'''
+                            UPDATE {first_limit_topics_table}
                             SET first_limit_id = ?
                             WHERE first_limit_id = ? AND association_date = ?
                         ''', (new_id, old_id, limit_date))
@@ -479,9 +577,9 @@ class DataAcquisitionService:
                 if updated_count > 0:
                     logger.info(f"✓ 数据刷新后更新 first_limit_topics 表的 first_limit_id: {updated_count}条")
 
-            if to_save_continuous_limits:
-                cursor.executemany('''
-                    INSERT OR REPLACE INTO continuous_limits_history
+            if to_save_continuous_limits and continuous_limits_table:
+                cursor.executemany(f'''
+                    INSERT OR REPLACE INTO {continuous_limits_table}
                     (trade_date, code, name, price, first_time, continuous_days, sector, reason, amount, create_time)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', to_save_continuous_limits)
@@ -491,91 +589,94 @@ class DataAcquisitionService:
 
             first_limit_count = len(first_limit_stocks)
             continuous_limit_count = sum(1 for s in all_limit_stocks if s['continuous_days'] >= 2)
-            exploded_count = sum(s['exploded_count'] for s in all_limit_stocks)
+            exploded_count = 0
 
             # 获取两种类型的炸板数据并存入exploded表
+            # 仅在非临时表（盘后刷新）时获取炸板数据
             # 类型1：涨停股池中炸过板的票（hslt/ztgc接口，最终涨停）
             # 类型2：炸板且最终未涨停的票（hslt/zbgc接口，未涨停）- 用于limit_stats统计
             exploded_stocks_ztgc = []
             exploded_stocks_zbgc = []
 
-            if MAIRUI_LICENCE:
-                # 类型1：从hslt/ztgc接口获取涨停股池中炸过板的票
-                try:
-                    ztgc_url = f"{MAIRUI_BASE_URL}/hslt/ztgc/{date}/{MAIRUI_LICENCE}"
-                    logger.info(f"调用 Mairui 涨停接口获取炸板数据: {ztgc_url}")
-                    ztgc_response = requests.get(ztgc_url, timeout=30)
+            if not use_tmp_table and MAIRUI_LICENCE:
+                    # 类型1：从hslt/ztgc接口获取涨停股池中炸过板的票
+                    try:
+                        ztgc_url = f"{MAIRUI_BASE_URL}/hslt/ztgc/{date}/{MAIRUI_LICENCE}"
+                        logger.info(f"调用 Mairui 涨停接口获取炸板数据: {ztgc_url}")
+                        ztgc_response = mairui_get_with_retry(ztgc_url)
 
-                    if ztgc_response.status_code == 200:
-                        ztgc_data = ztgc_response.json() if isinstance(ztgc_response.json(), list) else []
+                        if ztgc_response and ztgc_response.status_code == 200:
+                            increment_mairui_api_usage()
+                            ztgc_data = ztgc_response.json() if isinstance(ztgc_response.json(), list) else []
 
-                        logger.info(f"[DEBUG] Mairui 涨停数据获取成功: {len(ztgc_data)} 条")
-                        if ztgc_data:
-                            logger.info(f"[DEBUG] Mairui 涨停数据字段名: {list(ztgc_data[0].keys())}")
+                            logger.info(f"[DEBUG] Mairui 涨停数据获取成功: {len(ztgc_data)} 条")
+                            if ztgc_data:
+                                logger.info(f"[DEBUG] Mairui 涨停数据字段名: {list(ztgc_data[0].keys())}")
 
-                        # 筛选zbc>0的股票（炸过板但最终涨停的票）
-                        exploded_stocks_ztgc = [
-                            {
-                                'code': stock.get('dm', ''),
-                                'name': stock.get('mc', ''),
-                                'price': stock.get('p', 0),
-                                'first_time': stock.get('lbt', ''),
-                                'zbc': stock.get('zbc', 0),
-                                'lbc': stock.get('lbc', 0),
-                                'amount': stock.get('cje', 0),
-                                'sector': stock.get('hy', ''),
-                                'explode_type': 'limit_with_explode'
-                            }
-                            for stock in ztgc_data
-                            if stock.get('zbc', 0) > 0
-                        ]
-                        logger.info(f"✓ 涨停股池中炸过的票: {len(exploded_stocks_ztgc)} 只")
-                        if exploded_stocks_ztgc:
-                            logger.info(f"[DEBUG] 涨停炸板股票样本（前2条）: {json.dumps(exploded_stocks_ztgc[:2], ensure_ascii=False)[:500]}")
-                    else:
-                        logger.warning(f"Mairui 涨停接口错误: {ztgc_response.status_code}")
-                except Exception as e:
-                    logger.warning(f"获取 Mairui 涨停数据失败: {e}")
+                            # 筛选zbc>0的股票（炸过板但最终涨停的票）
+                            exploded_stocks_ztgc = [
+                                {
+                                    'code': stock.get('dm', ''),
+                                    'name': stock.get('mc', ''),
+                                    'price': stock.get('p', 0),
+                                    'first_time': stock.get('lbt', ''),
+                                    'zbc': stock.get('zbc', 0),
+                                    'lbc': stock.get('lbc', 0),
+                                    'amount': stock.get('cje', 0),
+                                    'sector': stock.get('hy', ''),
+                                    'explode_type': 'limit_with_explode'
+                                }
+                                for stock in ztgc_data
+                                if stock.get('zbc', 0) > 0
+                            ]
+                            logger.info(f"✓ 涨停股池中炸过的票: {len(exploded_stocks_ztgc)} 只")
+                            if exploded_stocks_ztgc:
+                                logger.info(f"[DEBUG] 涨停炸板股票样本（前2条）: {json.dumps(exploded_stocks_ztgc[:2], ensure_ascii=False)[:500]}")
+                        else:
+                            logger.warning(f"Mairui 涨停接口最终失败: {ztgc_response.status_code if ztgc_response else 'N/A'}")
+                    except Exception as e:
+                        logger.warning(f"获取 Mairui 涨停数据失败: {e}")
 
-                # 类型2：从hslt/zbgc接口获取炸板且最终未涨停的票（用于limit_stats统计）
-                try:
-                    zbgc_url = f"{MAIRUI_BASE_URL}/hslt/zbgc/{date}/{MAIRUI_LICENCE}"
-                    logger.info(f"调用 Mairui 炸板接口获取炸板数据: {zbgc_url}")
-                    zbgc_response = requests.get(zbgc_url, timeout=30)
+                    # 类型2：从hslt/zbgc接口获取炸板且最终未涨停的票（用于limit_stats统计）
+                    try:
+                        zbgc_url = f"{MAIRUI_BASE_URL}/hslt/zbgc/{date}/{MAIRUI_LICENCE}"
+                        logger.info(f"调用 Mairui 炸板接口获取炸板数据: {zbgc_url}")
+                        zbgc_response = mairui_get_with_retry(zbgc_url)
 
-                    if zbgc_response.status_code == 200:
-                        zbgc_data = zbgc_response.json() if isinstance(zbgc_response.json(), list) else []
+                        if zbgc_response and zbgc_response.status_code == 200:
+                            increment_mairui_api_usage()
+                            zbgc_data = zbgc_response.json() if isinstance(zbgc_response.json(), list) else []
 
-                        logger.info(f"[DEBUG] Mairui 炸板数据获取成功: {len(zbgc_data)} 条")
-                        if zbgc_data:
-                            logger.info(f"[DEBUG] Mairui 炸板数据字段名: {list(zbgc_data[0].keys())}")
-                            logger.info(f"[DEBUG] Mairui 炸板数据样本（第1条）: {json.dumps(zbgc_data[0], ensure_ascii=False)[:500]}")
+                            logger.info(f"[DEBUG] Mairui 炸板数据获取成功: {len(zbgc_data)} 条")
+                            if zbgc_data:
+                                logger.info(f"[DEBUG] Mairui 炸板数据字段名: {list(zbgc_data[0].keys())}")
+                                logger.info(f"[DEBUG] Mairui 炸板数据样本（第1条）: {json.dumps(zbgc_data[0], ensure_ascii=False)[:500]}")
 
-                        # 提取炸板且最终未涨停的股票数据
-                        exploded_stocks_zbgc = [
-                            {
-                                'code': stock.get('dm', ''),
-                                'name': stock.get('mc', ''),
-                                'price': stock.get('p', 0),
-                                'first_time': stock.get('lbt', ''),
-                                'zbc': stock.get('zbc', 0),
-                                'lbc': stock.get('lbc', 0),
-                                'amount': stock.get('cje', 0),
-                                'sector': stock.get('hy', ''),
-                                'explode_type': 'pure_explode'
-                            }
-                            for stock in zbgc_data
-                        ]
+                            # 提取炸板且最终未涨停的股票数据
+                            exploded_stocks_zbgc = [
+                                {
+                                    'code': stock.get('dm', ''),
+                                    'name': stock.get('mc', ''),
+                                    'price': stock.get('p', 0),
+                                    'first_time': stock.get('lbt', ''),
+                                    'zbc': stock.get('zbc', 0),
+                                    'lbc': stock.get('lbc', 0),
+                                    'amount': stock.get('cje', 0),
+                                    'sector': stock.get('hy', ''),
+                                    'explode_type': 'pure_explode'
+                                }
+                                for stock in zbgc_data
+                            ]
 
-                        # 统计炸板数量（用于limit_stats）
-                        exploded_count = len(exploded_stocks_zbgc)
-                        logger.info(f"✓ Mairui 炸板数据获取成功: {exploded_count} 只（炸板且最终未涨停）")
-                        if exploded_stocks_zbgc:
-                            logger.info(f"[DEBUG] 炸板且未涨停股票样本（前2条）: {json.dumps(exploded_stocks_zbgc[:2], ensure_ascii=False)[:500]}")
-                    else:
-                        logger.warning(f"Mairui 炸板接口错误: {zbgc_response.status_code}，使用 AkShare 数据作为备用")
-                except Exception as e:
-                    logger.warning(f"获取 Mairui 炸板数据失败: {e}，使用 AkShare 数据作为备用")
+                            # 统计炸板数量（用于limit_stats）
+                            exploded_count = len(exploded_stocks_zbgc)
+                            logger.info(f"✓ Mairui 炸板数据获取成功: {exploded_count} 只（炸板且最终未涨停）")
+                            if exploded_stocks_zbgc:
+                                logger.info(f"[DEBUG] 炸板且未涨停股票样本（前2条）: {json.dumps(exploded_stocks_zbgc[:2], ensure_ascii=False)[:500]}")
+                        else:
+                            logger.warning(f"Mairui 炸板接口最终失败: {zbgc_response.status_code if zbgc_response else 'N/A'}，使用 AkShare 数据作为备用")
+                    except Exception as e:
+                        logger.warning(f"获取 Mairui 炸板数据失败: {e}，使用 AkShare 数据作为备用")
 
             total_for_rate = exploded_count + first_limit_count + continuous_limit_count
             explode_rate = (exploded_count / total_for_rate * 100) if total_for_rate > 0 else 0
@@ -584,13 +685,21 @@ class DataAcquisitionService:
             results["continuous_limit_count"] = continuous_limit_count
             results["exploded_count"] = exploded_count
 
-            self.save_limit_stats(date, first_limit_count, continuous_limit_count, exploded_count, results["limit_down_count"], explode_rate)
+            # 仅在非临时表（盘后刷新）时保存统计数据
+            if not use_tmp_table:
+                try:
+                    self.save_limit_stats(date, first_limit_count, continuous_limit_count, exploded_count, results["limit_down_count"], explode_rate, limit_stats_table)
+                except Exception as e:
+                    logger.error(f"保存涨跌停统计数据失败，但不影响其他数据: {e}")
+                    results["limit_stats_error"] = str(e)
+            else:
+                logger.info("盘中模式：跳过统计数据保存")
 
             # 保存两种炸板数据到 exploded 表
             # 类型1：涨停股池中炸过的票
             if exploded_stocks_ztgc:
                 try:
-                    saved_count = self._save_exploded_data(exploded_stocks_ztgc, date, 'limit_with_explode')
+                    saved_count = self._save_exploded_data(exploded_stocks_ztgc, date, 'limit_with_explode', exploded_table)
                     logger.info(f"涨停炸板数据已保存: {saved_count} 条")
                 except Exception as e:
                     logger.warning(f"保存涨停炸板数据失败: {e}")
@@ -598,7 +707,7 @@ class DataAcquisitionService:
             # 类型2：炸板且最终未涨停的票
             if exploded_stocks_zbgc:
                 try:
-                    saved_count = self._save_exploded_data(exploded_stocks_zbgc, date, 'pure_explode')
+                    saved_count = self._save_exploded_data(exploded_stocks_zbgc, date, 'pure_explode', exploded_table)
                     logger.info(f"炸板且未涨停数据已保存: {saved_count} 条")
                 except Exception as e:
                     logger.warning(f"保存炸板未涨停数据失败: {e}")
@@ -606,6 +715,9 @@ class DataAcquisitionService:
             logger.info(f"涨停数据保存完成: 首板{first_limit_count}只, 连板{continuous_limit_count}只, 炸板{exploded_count}次, 跌停{results['limit_down_count']}只")
             results["success"] = True
             results["message"] = f"成功保存涨停数据: 首板{first_limit_count}只, 连板{continuous_limit_count}只"
+
+            if "limit_stats_error" in results:
+                results["message"] += f"（统计表保存失败，请检查日志）"
 
             return results
 
@@ -623,16 +735,35 @@ class DataAcquisitionService:
             }
 
     def save_limit_stats(self, trade_date: str, first_limit: int, continuous_limit: int,
-                         exploded: int, limit_down: int, explode_rate: float, market_mood: int = 3) -> bool:
-        """保存涨跌停统计数据"""
+                         exploded: int, limit_down: int, explode_rate: float,
+                         limit_stats_table: str = "limit_stats", market_mood: int = 3) -> bool:
+        """保存涨跌停统计数据
+
+        Args:
+            trade_date: 交易日期
+            first_limit: 首板数量
+            continuous_limit: 连板数量
+            exploded: 炸板数量
+            limit_down: 跌停数量
+            explode_rate: 炸板率
+            limit_stats_table: 统计表名（limit_stats 或 limit_stats_tmp）
+            market_mood: 市场情绪
+
+        Returns:
+            True: 保存成功
+            False: 保存失败
+
+        Raises:
+            Exception: 保存失败时抛出异常（包含详细信息）
+        """
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
 
             now = datetime.now().isoformat()
 
-            cursor.execute('''
-                INSERT INTO limit_stats
+            cursor.execute(f'''
+                INSERT INTO {limit_stats_table}
                 (trade_date, first_limit, continuous_limit, exploded, limit_down, explode_rate, market_mood, create_time, update_time)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_date) DO UPDATE SET
@@ -641,15 +772,18 @@ class DataAcquisitionService:
                     exploded = excluded.exploded,
                     limit_down = excluded.limit_down,
                     explode_rate = excluded.explode_rate,
-                    update_time = excluded.update_time
-            ''', (trade_date, first_limit, continuous_limit, exploded, limit_down, explode_rate, market_mood, now, now))
+                    update_time = ?
+            ''', (trade_date, first_limit, continuous_limit, exploded, limit_down, explode_rate, market_mood, now, now, now))
 
             conn.commit()
             conn.close()
+
+            logger.info(f"✓ 涨跌停统计数据已保存: {trade_date}, 首板={first_limit}, 连板={continuous_limit}, 炸板={exploded}, 跌停={limit_down}, 炸板率={explode_rate:.2f}%")
             return True
         except Exception as e:
-            logger.error(f"保存统计数据失败: {e}")
-            return False
+            error_msg = f"保存涨跌停统计数据失败: {trade_date}, 错误: {e}"
+            logger.error(error_msg, exc_info=True)
+            raise Exception(error_msg) from e
 
     def _save_limit_down_data(self, limit_down_data: List[Dict], trade_date: str) -> int:
         """保存跌停数据到 limit_down 表和 limit_down_history 表
@@ -806,8 +940,8 @@ class DataAcquisitionService:
             logger.error(f"保存连续跌停历史失败: {e}", exc_info=True)
             return 0
 
-    def _save_exploded_data(self, exploded_list: List[Dict], trade_date: str, explode_type: str) -> int:
-        """保存炸板数据到 exploded 表
+    def _save_exploded_data(self, exploded_list: List[Dict], trade_date: str, explode_type: str, exploded_table: str = "exploded") -> int:
+        """保存炸板数据到 exploded 或 exploded_tmp 表
 
         Args:
             exploded_list: 炸板股票列表
@@ -815,6 +949,7 @@ class DataAcquisitionService:
             explode_type: 炸板类型（'limit_with_explode' 或 'pure_explode'）
                 - 'limit_with_explode': 涨停股池中炸过板的票（hslt/ztgc接口，最终涨停）
                 - 'pure_explode': 炸板且最终未涨停的票（hslt/zbgc接口，未涨停）
+            exploded_table: 表名（'exploded' 或 'exploded_tmp'）
 
         Returns:
             保存的记录数
@@ -846,13 +981,13 @@ class DataAcquisitionService:
                     stock_id = self._get_or_create_stock(code, name, sector, conn, cursor)
                     create_time = f"{trade_date}T16:00:00"
 
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO exploded
+                    cursor.execute(f'''
+                        INSERT OR REPLACE INTO {exploded_table}
                         (stock_id, trade_date, limit_price, first_limit_time, exploded_count,
                          continuous_days, amount, sector, reason, source, explode_type, create_time)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (stock_id, trade_date, price, first_time, exploded_count,
-                          continuous_days, amount, sector, '炸板', 'mairui', explode_type, create_time))
+                           continuous_days, amount, sector, '炸板', 'mairui', explode_type, create_time))
 
                     saved_count += 1
 
@@ -1120,21 +1255,38 @@ class DataAcquisitionService:
             else:
                 today = datetime.now().strftime("%Y-%m-%d")
 
-            # 获取实时行情数据
-            try:
-                df = ak.stock_zh_a_spot_em()
+            # 获取实时行情数据（带重试机制）
+            max_retries = 3
+            retry_delay = 2
+            df = None
 
-                if df is None or len(df) == 0:
-                    logger.warning("未获取到实时行情数据")
-                    results["message"] = "未获取到实时行情数据"
+            for attempt in range(max_retries):
+                try:
+                    df = ak.stock_zh_a_spot_em()
+
+                    if df is None or len(df) == 0:
+                        logger.warning(f"未获取到实时行情数据 (尝试 {attempt + 1}/{max_retries})")
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                            continue
+                        results["message"] = "未获取到实时行情数据"
+                        return results
+
+                    # 按成交额排序取前20名
+                    df_sorted = df.nlargest(20, '成交额')
+                    break
+
+                except Exception as e:
+                    logger.error(f"获取实时行情数据失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    results["message"] = f"获取实时行情数据失败: {e}"
                     return results
 
-                # 按成交额排序取前20名
-                df_sorted = df.nlargest(20, '成交额')
-
-            except Exception as e:
-                logger.error(f"获取实时行情数据失败: {e}")
-                results["message"] = f"获取实时行情数据失败: {e}"
+            if df is None or df_sorted is None:
+                logger.warning(f"获取实时行情数据失败: 达到最大重试次数 {max_retries}")
+                results["message"] = f"获取实时行情数据失败: 达到最大重试次数 {max_retries}"
                 return results
 
             logger.info(f"成功获取成交额数据: {len(df_sorted)} 条")
@@ -1239,4 +1391,197 @@ class DataAcquisitionService:
                 "message": f"系统错误: {e}",
                 "type_name": amount_type,
                 "record_count": 0
+            }
+
+    async def fetch_and_save_strong_stocks(self, trade_date: str = None) -> Dict:
+        """获取并保存强势股池数据
+
+        数据源：Mairui API - hslt/qsgc (强势股池)
+        - 获取指定日期的强势股池数据
+        - 按热度类型（rx字段）分类存储
+        - 热度类型包括：60日新高、近期多次涨停等
+
+        Args:
+            trade_date: 交易日期（格式: YYYY-MM-DD），不传则使用当前日期
+
+        Returns:
+            {
+                "success": True/False,
+                "message": "执行结果描述",
+                "total_count": 总记录数,
+                "hot_types": ["60日新高", "近期多次涨停", ...]
+            }
+        """
+        import asyncio
+
+        try:
+            results = {
+                "success": False,
+                "message": "",
+                "total_count": 0,
+                "hot_types": []
+            }
+
+            if not MAIRUI_LICENCE:
+                logger.warning("Mairui License 未配置，无法获取强势股池数据")
+                results["message"] = "Mairui License 未配置"
+                return results
+
+            # 使用指定的交易日期，不传则使用当前日期
+            if trade_date:
+                today = trade_date
+            else:
+                today = datetime.now().strftime("%Y-%m-%d")
+
+            logger.info(f"开始获取 {today} 的强势股池数据")
+
+            # 调用 Mairui API
+            def _fetch_strong_data():
+                url = f"{MAIRUI_BASE_URL}/{MAIRUI_STRONG_API_URL}/{today}/{MAIRUI_LICENCE}"
+                return mairui_get_with_retry(url)
+
+            try:
+                response = await asyncio.to_thread(_fetch_strong_data)
+
+                if not response or response.status_code != 200:
+                    logger.warning(f"Mairui 强势股池接口最终失败: {response.status_code if response else 'N/A'}")
+                    results["message"] = f"Mairui API 错误: {response.status_code if response else 'N/A'}"
+                    return results
+
+                strong_data = response.json()
+
+                if not isinstance(strong_data, list) or len(strong_data) == 0:
+                    logger.warning(f"返回空数据: {today}")
+                    results["message"] = "返回空数据（可能是非交易日或数据未更新）"
+                    return results
+
+                logger.info(f"✓ Mairui 强势股池数据获取成功: {len(strong_data)} 条")
+                if strong_data:
+                    logger.info(f"  强势股数据字段名: {list(strong_data[0].keys())}")
+
+            except Exception as e:
+                logger.warning(f"获取 Mairui 强势股池数据失败: {e}")
+                results["message"] = f"接口调用失败: {str(e)}"
+                return results
+
+            # API调用成功，增加计数
+            increment_mairui_api_usage()
+
+            # 解析数据并按热度类型分组
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # 初始化热度类型统计
+            hot_type_groups = {}
+
+            stock_cache = {}
+
+            for stock in strong_data:
+                try:
+                    code = stock.get('dm', '')
+                    name = stock.get('mc', '')
+
+                    if not code or not name:
+                        continue
+
+                    hot_type = stock.get('rx', '未知')
+
+                    if hot_type not in hot_type_groups:
+                        hot_type_groups[hot_type] = []
+
+                    price = float(stock.get('p', 0)) if stock.get('p') else 0
+                    change_pct = float(stock.get('zf', 0)) if stock.get('zf') else 0
+                    amount = float(stock.get('cje', 0)) if stock.get('cje') else 0
+                    turnover_rate = float(stock.get('hs', 0)) if stock.get('hs') else 0
+                    volume_ratio = float(stock.get('lb', 0)) if stock.get('lb') else 0
+                    is_new_high = 1 if stock.get('nh') == '是' else 0
+
+                    # 解析统计信息 tj (如 "1/1" 或 "2/2")
+                    continuous_limit_days = 0
+                    tj = stock.get('tj', '')
+                    if tj and '/' in tj:
+                        try:
+                            continuous_limit_days = int(tj.split('/')[0])
+                        except:
+                            pass
+
+                    sector = stock.get('hy', '')
+
+                    stock_id = self._get_or_create_stock(code, name, sector, conn, cursor)
+
+                    if stock_id < 0:
+                        continue
+
+                    hot_type_groups[hot_type].append({
+                        'stock_id': stock_id,
+                        'code': code,
+                        'name': name,
+                        'price': price,
+                        'change_pct': change_pct,
+                        'amount': amount,
+                        'turnover_rate': turnover_rate,
+                        'volume_ratio': volume_ratio,
+                        'is_new_high': is_new_high,
+                        'continuous_limit_days': continuous_limit_days,
+                        'sector': sector,
+                        'hot_type': hot_type
+                    })
+
+                except Exception as e:
+                    logger.warning(f"处理强势股记录失败: code={stock.get('dm', '')}, error={e}")
+                    continue
+
+            # 保存数据到 strong_stocks 表
+            total_saved = 0
+            create_time = f"{today}T16:00:00"
+
+            for hot_type, stock_list in hot_type_groups.items():
+                logger.info(f"热度类型 {hot_type}: {len(stock_list)} 只")
+
+                # 创建或更新热度类型记录
+                cursor.execute('''
+                    INSERT OR IGNORE INTO strong_stock_types
+                    (type_name, description, sort_order, is_active, created_at, updated_at)
+                    VALUES (?, ?, 0, 1, ?, ?)
+                ''', (hot_type, f'强势股池 - {hot_type}', datetime.now().isoformat(), datetime.now().isoformat()))
+
+                for rank, stock_data in enumerate(stock_list, 1):
+                    try:
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO strong_stocks
+                            (stock_id, trade_date, hot_type, rank, price, change_percent, amount,
+                             turnover_rate, volume_ratio, is_new_high, continuous_limit_days,
+                             sector, reason, source, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            stock_data['stock_id'], today, hot_type, rank,
+                            stock_data['price'], stock_data['change_pct'], stock_data['amount'],
+                            stock_data['turnover_rate'], stock_data['volume_ratio'],
+                            stock_data['is_new_high'], stock_data['continuous_limit_days'],
+                            stock_data['sector'], f'{hot_type}强势股', 'mairui', create_time
+                        ))
+                        total_saved += 1
+                    except Exception as e:
+                        logger.warning(f"保存强势股记录失败: {hot_type}, code={stock_data['code']}, error={e}")
+                        continue
+
+            conn.commit()
+            conn.close()
+
+            logger.info(f"强势股池数据保存完成: 总计 {total_saved} 条，热度类型 {len(hot_type_groups)} 个")
+
+            results["success"] = True
+            results["message"] = f"成功保存强势股池数据: {total_saved} 条"
+            results["total_count"] = total_saved
+            results["hot_types"] = list(hot_type_groups.keys())
+
+            return results
+
+        except Exception as e:
+            logger.error(f"获取并保存强势股池失败: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": f"系统错误: {e}",
+                "total_count": 0,
+                "hot_types": []
             }

@@ -306,12 +306,13 @@ class MarketMoodCalculator:
             # 方法：查询当前日期之前的最近30条数据，计算中位数
             # 这样可以获取更准确的中位数，而不是基于时间范围的估算
             
-            # 首板中位数（使用最近10个交易日，包含当天）
+            # 首板中位数（使用最近10个交易日，包含当天；限定 trade_date <= 计算日，确保历史日期重算时 medians 不变）
             cursor.execute('''
-                SELECT trade_date, first_limit 
-                FROM limit_stats 
+                SELECT trade_date, first_limit
+                FROM limit_stats
+                WHERE trade_date <= ?
                 ORDER BY trade_date DESC LIMIT 10
-            ''')
+            ''', (trade_date,))
             first_limits = [row[1] for row in cursor.fetchall()]
             if first_limits:
                 first_limits_sorted = sorted(first_limits)
@@ -321,13 +322,14 @@ class MarketMoodCalculator:
                     medians['first_limit'] = first_limits_sorted[len(first_limits_sorted)//2]
             else:
                 medians['first_limit'] = 30  # 默认值
-            
-            # 连板中位数（使用最近10个交易日，包含当天）
+
+            # 连板中位数（使用最近10个交易日，包含当天；限定 trade_date <= 计算日）
             cursor.execute('''
-                SELECT trade_date, continuous_limit 
-                FROM limit_stats 
+                SELECT trade_date, continuous_limit
+                FROM limit_stats
+                WHERE trade_date <= ?
                 ORDER BY trade_date DESC LIMIT 10
-            ''')
+            ''', (trade_date,))
             continuous_limits = [row[1] for row in cursor.fetchall()]
             if continuous_limits:
                 continuous_limits_sorted = sorted(continuous_limits)
@@ -337,13 +339,14 @@ class MarketMoodCalculator:
                     medians['continuous_limit'] = continuous_limits_sorted[len(continuous_limits_sorted)//2]
             else:
                 medians['continuous_limit'] = 10.5  # 默认值
-            
-            # 跌停中位数（使用最近10个交易日，包含当天）
+
+            # 跌停中位数（使用最近10个交易日，包含当天；限定 trade_date <= 计算日）
             cursor.execute('''
-                SELECT trade_date, limit_down 
-                FROM limit_stats 
+                SELECT trade_date, limit_down
+                FROM limit_stats
+                WHERE trade_date <= ?
                 ORDER BY trade_date DESC LIMIT 10
-            ''')
+            ''', (trade_date,))
             limit_downs = [row[1] for row in cursor.fetchall()]
             if limit_downs:
                 limit_downs_sorted = sorted(limit_downs)
@@ -411,12 +414,13 @@ class MarketMoodCalculator:
             else:
                 medians['six_month_high'] = None
             
-            # 炸板率中位数（使用最近10个交易日，包含当天）
+            # 炸板率中位数（使用最近10个交易日，包含当天；限定 trade_date <= 计算日）
             cursor.execute('''
-                SELECT explode_rate 
-                FROM limit_stats 
+                SELECT explode_rate
+                FROM limit_stats
+                WHERE trade_date <= ?
                 ORDER BY trade_date DESC LIMIT 10
-            ''')
+            ''', (trade_date,))
             explode_rates = [row[0] for row in cursor.fetchall()]
             if explode_rates:
                 explode_rates_sorted = sorted(explode_rates)
@@ -640,6 +644,49 @@ class MarketMoodCalculator:
             }
 
             return score, None, detail
+
+        # ========== 跌停权重修正试用 ==========
+        # 跌停额外扣分（第二扣分项）：结合绝对值和倍数的数学公式
+        # 公式：penalty = (|v-m|^1.2×0.35 + (v/m-1)^2×3.0×0.65) × (m+1.5)/(m+7.5) × weight × 0.2
+        # 特点：无if-else判断，单行公式解决；中下减少扣分，中上保持重伤门槛
+        elif indicator_code == 'limit_down_extra':
+            value = data.get('limit_down', 0)
+            median = medians.get('limit_down', 5)
+
+            if value <= median:
+                return 0, 0, {
+                    'value': value,
+                    'median': median,
+                    'reason': '低于或等于中位数，不额外扣分'
+                }
+
+            if median <= 0:
+                penalty = value * 0.5 * weight
+                return -penalty, 0, {
+                    'value': value,
+                    'median': median,
+                    'score': -penalty,
+                    'reason': '中位数为0，按绝对值扣分'
+                }
+
+            abs_diff = value - median
+            ratio = value / median
+
+            # 核心公式：绝对值项 + 倍数项 × 基数调整 × 缩放系数
+            penalty = (abs_diff ** 1.2 * 0.35 + (ratio - 1) ** 2 * 3.0 * 0.65) * (median + 1.5) / (median + 7.5) * weight * 0.2
+
+            score = -penalty
+            detail = {
+                'value': value,
+                'median': median,
+                'abs_diff': abs_diff,
+                'ratio': ratio,
+                'base_factor': (median + 1.5) / (median + 7.5),
+                'penalty': penalty,
+                'score': score
+            }
+
+            return score, 0, detail
 
         else:
             score = 0

@@ -1,0 +1,43 @@
+{
+    "price": {
+        "enabled": true,
+        "min_enabled": true,
+        "max_enabled": false,
+        "min": 10.0,
+        "max": null
+    },
+    "change_percent": {
+        "enabled": true,
+        "min_enabled": true,
+        "max_enabled": false,
+        "min": 5.0,
+        "max": null
+    },
+    "amount": {
+        "enabled": true,
+        "min_enabled": true,
+        "max_enabled": false,
+        "min": 300.0,
+        "max": null
+    },
+    "turnover": {
+        "enabled": true,
+        "min_enabled": true,
+        "max_enabled": false,
+        "min": 2.0,
+        "max": null
+    },
+    "volume_ratio": {
+        "enabled": true,
+        "min_enabled": true,
+        "max_enabled": false,
+        "min": 1.0,
+        "max": null
+    },
+    "continuous_limit": {
+        "enabled": true,
+        "mode": "require",
+        "min_days": 2
+    },
+    "max_count": 20
+}

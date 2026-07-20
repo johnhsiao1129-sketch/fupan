@@ -8,3 +8,4 @@ akshare
 pandas
 numpy
 apscheduler>=3.10.0
+tenacity>=8.2.0

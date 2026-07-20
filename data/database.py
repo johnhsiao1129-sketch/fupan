@@ -419,6 +419,121 @@ def init_database():
         )
     ''')
 
+    # 17. 强势股数据表
+    # 业务规则：每天获取强势股池数据并存储，按热度类型分类
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS strong_stocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id INTEGER NOT NULL,
+            trade_date TEXT NOT NULL,
+            hot_type TEXT NOT NULL,
+            rank INTEGER,
+            price REAL,
+            change_percent REAL,
+            amount REAL,
+            turnover_rate REAL,
+            volume_ratio REAL,
+            is_new_high INTEGER DEFAULT 0,
+            continuous_limit_days INTEGER DEFAULT 0,
+            sector TEXT,
+            reason TEXT,
+            source TEXT DEFAULT 'mairui',
+            created_at TEXT NOT NULL,
+            UNIQUE(stock_id, trade_date, hot_type),
+            FOREIGN KEY (stock_id) REFERENCES stocks(stock_id) ON DELETE CASCADE
+        )
+    ''')
+
+    # 18. 强势股热度类型表（用于管理不同的热度分类）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS strong_stock_types (
+            type_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type_name TEXT UNIQUE NOT NULL,
+            description TEXT,
+            sort_order INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        )
+    ''')
+
+     # 19. 趋势票表（存储趋势票分析结果）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS trend_stocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id INTEGER NOT NULL,
+            trade_date TEXT NOT NULL,
+            total_score INTEGER NOT NULL,
+            ma_score INTEGER NOT NULL,
+            gain_60d_score INTEGER NOT NULL,
+            volume_score INTEGER NOT NULL,
+            recent_score INTEGER NOT NULL,
+            ma60_score INTEGER NOT NULL,
+            sector_score INTEGER NOT NULL,  -- 题材强度得分
+            drawdown_score INTEGER NOT NULL,  -- 回撤控制得分
+            -- 趋势特征
+            ma5 REAL,
+            ma10 REAL,
+            ma20 REAL,
+            ma60 REAL,
+            change_pct_60d REAL,
+            drawdown_20d REAL,
+            volume_ratio REAL,
+            -- 分类
+            trend_level TEXT,  -- S/A/B/C
+            is_approximate INTEGER DEFAULT 0,  -- 0=精确分析, 1=初选(未验证)
+            created_at TEXT NOT NULL,
+            UNIQUE(stock_id, trade_date),
+            FOREIGN KEY (stock_id) REFERENCES stocks(stock_id) ON DELETE CASCADE
+        )
+    ''')
+
+    # 迁移：为已存在的 trend_stocks 添加新字段
+    cursor.execute("PRAGMA table_info(trend_stocks)")
+    columns = cursor.fetchall()
+    column_names = [col[1] for col in columns]
+
+    if 'is_approximate' not in column_names:
+        cursor.execute('ALTER TABLE trend_stocks ADD COLUMN is_approximate INTEGER DEFAULT 0')
+        print("已添加 is_approximate 字段到 trend_stocks 表")
+
+    if 'sector_score' not in column_names:
+        cursor.execute('ALTER TABLE trend_stocks ADD COLUMN sector_score INTEGER DEFAULT 0')
+        cursor.execute('UPDATE trend_stocks SET sector_score = 0 WHERE sector_score IS NULL')
+        print("已添加 sector_score 字段到 trend_stocks 表")
+
+    if 'drawdown_score' not in column_names:
+        cursor.execute('ALTER TABLE trend_stocks ADD COLUMN drawdown_score INTEGER DEFAULT 0')
+        cursor.execute('UPDATE trend_stocks SET drawdown_score = 0 WHERE drawdown_score IS NULL')
+        print("已添加 drawdown_score 字段到 trend_stocks 表")
+
+    # 20. 股票日K线数据表（存储趋势票的K线数据）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS stock_daily_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id INTEGER NOT NULL,
+            trade_date TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL,
+            amount REAL,
+            change_pct REAL,
+            turnover REAL,
+            ma5 REAL,
+            ma10 REAL,
+            ma20 REAL,
+            ma60 REAL,
+            volume_ratio REAL,
+            change_pct_60d REAL,
+            drawdown_20d REAL,
+            created_at TEXT NOT NULL,
+            UNIQUE(stock_id, trade_date),
+            FOREIGN KEY (stock_id) REFERENCES stocks(stock_id) ON DELETE CASCADE
+        )
+    ''')
+
     # ========== 新表索引 ==========
 
     # market_status_summary 表索引
@@ -430,7 +545,116 @@ def init_database():
     # continuous_limits_history 表索引
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_continuous_limits_history_trade_date ON continuous_limits_history(trade_date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_continuous_limits_history_code ON continuous_limits_history(code)')
-    
+
+    # strong_stocks 表索引
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_strong_stocks_date ON strong_stocks(trade_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_strong_stocks_stock ON strong_stocks(stock_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_strong_stocks_type ON strong_stocks(hot_type)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_strong_stocks_date_type ON strong_stocks(trade_date, hot_type)')
+
+    # strong_stock_types 表索引
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_strong_types_name ON strong_stock_types(type_name)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_strong_types_active ON strong_stock_types(is_active)')
+
+    # trend_stocks 表索引
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_stocks_date ON trend_stocks(trade_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_stocks_stock ON trend_stocks(stock_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_stocks_score ON trend_stocks(total_score)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_trend_stocks_date_score ON trend_stocks(trade_date, total_score)')
+
+    # stock_daily_data 表索引
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_daily_data_stock_date ON stock_daily_data(stock_id, trade_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_daily_data_date ON stock_daily_data(trade_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_daily_data_stock ON stock_daily_data(stock_id)')
+
+    # 21. 盘中记录表（手动记录盘面信息，每条带 HH:MM 时间标签）
+    # 业务规则：
+    # - trade_date + note_time 唯一：同一时间同一日期只一条
+    # - content 多段落用 \n\n 分隔
+    # - is_manual_time: 1=用户手选时间, 0=系统自动时间
+    # - created_at: 首次创建时刻（90s 合并判断用）
+    # - updated_at: 最后修改时刻
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS intraday_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            note_time TEXT NOT NULL,
+            content TEXT NOT NULL,
+            is_manual_time INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(trade_date, note_time)
+        )
+    ''')
+
+    # intraday_notes 表索引
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_intraday_notes_date ON intraday_notes(trade_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_intraday_notes_date_time ON intraday_notes(trade_date, note_time)')
+
+    # ========== 临时表（盘中数据） ==========
+    # 20. 首板临时表（盘中数据）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS first_limits_tmp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id INTEGER NOT NULL,
+            limit_date TEXT NOT NULL,
+            first_limit_time TEXT,
+            final_limit_time TEXT,
+            limit_price REAL,
+            open_price REAL,
+            amount REAL,
+            reason TEXT,
+            source TEXT,
+            create_time TEXT NOT NULL,
+            FOREIGN KEY (stock_id) REFERENCES stocks(stock_id) ON DELETE CASCADE
+        )
+    ''')
+
+    # 21. 首板-题材临时关联表（盘中数据）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS first_limit_topics_tmp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id INTEGER NOT NULL,
+            first_limit_id INTEGER,
+            topic_id INTEGER NOT NULL,
+            create_time TEXT NOT NULL,
+            association_date TEXT,
+            UNIQUE(stock_id, topic_id, association_date),
+            FOREIGN KEY (stock_id) REFERENCES stocks(stock_id) ON DELETE CASCADE,
+            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE
+        )
+    ''')
+
+    # 22. 题材临时激活表（盘中数据）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS topic_activations_tmp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id INTEGER NOT NULL,
+            activation_date TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            UNIQUE(topic_id, activation_date),
+            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE
+        )
+    ''')
+
+    # ========== 临时表索引 ==========
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limits_tmp_stock_date ON first_limits_tmp(stock_id, limit_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limits_tmp_date ON first_limits_tmp(limit_date)')
+
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limit_topics_tmp_limit ON first_limit_topics_tmp(first_limit_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limit_topics_tmp_topic ON first_limit_topics_tmp(topic_id)')
+
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_activations_tmp_topic_date ON topic_activations_tmp(topic_id, activation_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_activations_tmp_date ON topic_activations_tmp(activation_date)')
+
+    # ========== 修复 first_limits_tmp 表的 limit_type 默认值 ==========
+    cursor.execute("UPDATE first_limits_tmp SET limit_type = '10%' WHERE limit_type IS NULL")
+    updated_count = cursor.rowcount
+    if updated_count > 0:
+        print(f"✓ 已修复 first_limits_tmp 表的 limit_type 默认值: {updated_count} 条记录")
+
     conn.commit()
     conn.close()
     print(f"数据库初始化完成: {DB_PATH}")

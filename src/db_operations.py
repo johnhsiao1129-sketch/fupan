@@ -734,9 +734,9 @@ class RotationAnalysisDB:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            
+
             cursor.execute('''
-                SELECT 
+                SELECT
                     t.topic_id,
                     t.topic_name,
                     t.is_active,
@@ -750,7 +750,7 @@ class RotationAnalysisDB:
                 GROUP BY t.topic_id
                 ORDER BY last_active_date DESC
             ''')
-            
+
             topics = []
             for row in cursor.fetchall():
                 topics.append({
@@ -761,7 +761,7 @@ class RotationAnalysisDB:
                     'last_update': row[6],  # 使用最后活跃日期
                     'record_count': row[5] or 0
                 })
-            
+
             conn.close()
             return topics
         except Exception as e:
@@ -817,13 +817,24 @@ class RotationAnalysisDB:
             logger.error(f"获取题材标的失败: {e}")
             return []
     
-    def get_first_limits_by_date(self, date_str: str) -> List[Dict]:
-        """获取指定日期的首板数据"""
+    def get_first_limits_by_date(self, date_str: str, table: str = None) -> List[Dict]:
+        """获取指定日期的首板数据
+
+        参数:
+        - date_str: 查询日期
+        - table: 指定表名（None=自动判断）
+                - "first_limits" 或 "first_limits_tmp"
+        """
+        # 如果未指定表，根据时间自动判断
+        if table is None:
+            from src.main import is_in_trading_hours
+            table = "first_limits_tmp" if is_in_trading_hours() else "first_limits"
+
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            cursor.execute('''
+            cursor.execute(f'''
                 SELECT
                     fl.id,
                     fl.stock_id,
@@ -837,8 +848,8 @@ class RotationAnalysisDB:
                     fl.limit_type,
                     fl.amount,
                     fl.reason,
-                    fl.is_exploded
-                FROM first_limits fl
+                    coalesce(fl.is_exploded, 0) as is_exploded
+                FROM {table} fl
                 JOIN stocks s ON fl.stock_id = s.stock_id
                 WHERE fl.limit_date = ?
                 ORDER BY fl.first_limit_time
@@ -1012,10 +1023,18 @@ class RotationAnalysisDB:
             cursor = conn.cursor()
 
             # 获取首板记录的 first_limit_id（用于记录到 topic_stock_relations）
+            # 盘中数据可能在 first_limits_tmp 表中，先查询正式表，再查询临时表
             cursor.execute('''
                 SELECT id FROM first_limits WHERE stock_id = ? AND limit_date = ?
             ''', (stock_id, association_date))
             result = cursor.fetchone()
+
+            # 如果正式表中没找到，尝试从临时表查询（盘中临时数据）
+            if not result:
+                cursor.execute('''
+                    SELECT id FROM first_limits_tmp WHERE stock_id = ? AND limit_date = ?
+                ''', (stock_id, association_date))
+                result = cursor.fetchone()
 
             if not result:
                 logger.error(f"未找到首板记录: stock_id={stock_id}, limit_date={association_date}")
@@ -1042,6 +1061,24 @@ class RotationAnalysisDB:
                     VALUES (?, ?, ?, ?, ?)
                 ''', (stock_id, first_limit_id, topic_id, datetime.now().isoformat(), association_date))
                 logger.info(f"插入first_limit_topics: stock_id={stock_id}, first_limit_id={first_limit_id}, topic_id={topic_id}, association_date={association_date}")
+
+            # 盘中关联：同时写入临时表
+            from src.main import is_in_trading_hours
+            if is_in_trading_hours():
+                cursor.execute('''
+                    SELECT id FROM first_limit_topics_tmp
+                    WHERE stock_id = ? AND topic_id = ? AND association_date = ?
+                ''', (stock_id, topic_id, association_date))
+
+                if cursor.fetchone():
+                    logger.info(f"first_limit_topics_tmp关联已存在: stock_id={stock_id}, topic_id={topic_id}, association_date={association_date}")
+                else:
+                    cursor.execute('''
+                        INSERT INTO first_limit_topics_tmp
+                        (stock_id, first_limit_id, topic_id, create_time, association_date)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (stock_id, first_limit_id, topic_id, datetime.now().isoformat(), association_date))
+                    logger.info(f"插入first_limit_topics_tmp: stock_id={stock_id}, first_limit_id={first_limit_id}, topic_id={topic_id}, association_date={association_date}")
 
             # 插入到 topic_stock_relations（记录标的所属题材，持续有效，不区分日期）
             # 检查是否已存在该标的和题材的任意关联（不考虑日期）
@@ -1321,8 +1358,10 @@ class RotationAnalysisDB:
             - stock_name: 股票名称
             - limit_count: 近期涨停次数
             - max_continuous_days: 最高连板高度
-            - new_high_count: 新高次数（无新高则不返回）
-            - first_association_date: 最早关联题材日期
+            - new_high_count: 新高次数（无新高则不返回该字段）
+            - recent_new_high_date: 最近新高日期（source_id=9时才有该字段）
+            - recent_limit_date: 最近涨停日期
+            - first_association_date: 近期最早涨停日期
         """
         try:
             logger.info(f"[DEBUG] get_topic_active_stocks 开始: topic_name={topic_name}, days={days}")
@@ -1380,19 +1419,20 @@ class RotationAnalysisDB:
             max_date = max(trading_dates)
             logger.info(f"[DEBUG] 日期范围: min_date={min_date}, max_date={max_date}")
 
-            # 查询该题材的股票在近N个交易日内的首板记录
+            # 查询该题材的股票在近N个交易日内的涨停记录
             stock_ids = [s[2] for s in topic_stocks]
             placeholders = ','.join(['?' for _ in stock_ids])
 
             cursor.execute(f'''
                 SELECT
-                    fl.stock_id,
-                    COUNT(DISTINCT fl.limit_date) as limit_count
-                FROM first_limits fl
-                WHERE fl.stock_id IN ({placeholders})
-                  AND fl.limit_date BETWEEN ? AND ?
-                GROUP BY fl.stock_id
-                HAVING COUNT(DISTINCT fl.limit_date) > 0
+                    s.stock_id,
+                    COUNT(DISTINCT cl.trade_date) as limit_count
+                FROM continuous_limits_history cl
+                JOIN stocks s ON cl.code = s.stock_code
+                WHERE s.stock_id IN ({placeholders})
+                  AND cl.trade_date BETWEEN ? AND ?
+                GROUP BY s.stock_id
+                HAVING COUNT(DISTINCT cl.trade_date) > 0
             ''', stock_ids + [min_date, max_date])
 
             limit_stats = {row[0]: row[1] for row in cursor.fetchall()}
@@ -1419,36 +1459,69 @@ class RotationAnalysisDB:
             logger.info(f"[DEBUG] 有连板记录的股票数: {len(continuous_stats)}, continuous_stats={continuous_stats}")
 
             stocks = []
-            for stock_code, stock_name, stock_id, first_association_date in topic_stocks:
-                if stock_id not in limit_stats:
-                    continue
+            for stock_code, stock_name, stock_id, _ in topic_stocks:
+                 if stock_id not in limit_stats:
+                     continue
 
-                logger.info(f"[DEBUG] 处理股票: stock_code={stock_code}, stock_name={stock_name}, stock_id={stock_id}, first_association_date={first_association_date}")
+                 logger.info(f"[DEBUG] 处理股票: stock_code={stock_code}, stock_name={stock_name}, stock_id={stock_id}")
 
-                stock_data = {
-                    'stock_code': stock_code,
-                    'stock_name': stock_name,
-                    'stock_id': stock_id,
-                    'limit_count': limit_stats[stock_id],
-                    'max_continuous_days': continuous_stats.get(stock_code, 0),
-                    'first_association_date': first_association_date
-                }
+                 stock_data = {
+                     'stock_code': stock_code,
+                     'stock_name': stock_name,
+                     'stock_id': stock_id,
+                     'limit_count': limit_stats[stock_id],
+                     'max_continuous_days': continuous_stats.get(stock_code, 0)
+                 }
 
-                # 查询新高次数（从 popularity_stocks 表查询，source_id=9为历史新高）
-                cursor.execute('''
-                    SELECT COUNT(*) 
-                    FROM popularity_stocks
-                    WHERE stock_id = ? 
-                      AND source_id = 9
-                      AND trade_date BETWEEN ? AND ?
-                ''', (stock_id, min_date, max_date))
-                new_high_result = cursor.fetchone()
-                new_high_count = new_high_result[0] if new_high_result else 0
+                 cursor.execute(f'''
+                     SELECT MIN(trade_date)
+                     FROM continuous_limits_history cl
+                     JOIN stocks s ON cl.code = s.stock_code
+                     WHERE s.stock_id = ?
+                       AND cl.trade_date BETWEEN ? AND ?
+                 ''', (stock_id, min_date, max_date))
+                 first_limit_result = cursor.fetchone()
+                 if first_limit_result and first_limit_result[0]:
+                     stock_data['first_association_date'] = first_limit_result[0]
+                 else:
+                     stock_data['first_association_date'] = None
 
-                if new_high_count > 0:
-                    stock_data['new_high_count'] = new_high_count
+                 cursor.execute(f'''
+                     SELECT MAX(trade_date)
+                     FROM continuous_limits_history cl
+                     JOIN stocks s ON cl.code = s.stock_code
+                     WHERE s.stock_id = ?
+                       AND cl.trade_date BETWEEN ? AND ?
+                 ''', (stock_id, min_date, max_date))
+                 recent_limit_result = cursor.fetchone()
+                 if recent_limit_result and recent_limit_result[0]:
+                     stock_data['recent_limit_date'] = recent_limit_result[0]
 
-                stocks.append(stock_data)
+                 cursor.execute('''
+                     SELECT COUNT(*)
+                     FROM popularity_stocks
+                     WHERE stock_id = ?
+                       AND source_id = 9
+                       AND trade_date BETWEEN ? AND ?
+                 ''', (stock_id, min_date, max_date))
+                 new_high_result = cursor.fetchone()
+                 new_high_count = new_high_result[0] if new_high_result else 0
+
+                 if new_high_count > 0:
+                     stock_data['new_high_count'] = new_high_count
+
+                     cursor.execute('''
+                         SELECT MAX(trade_date)
+                         FROM popularity_stocks
+                         WHERE stock_id = ?
+                           AND source_id = 9
+                           AND trade_date BETWEEN ? AND ?
+                     ''', (stock_id, min_date, max_date))
+                     recent_new_high_result = cursor.fetchone()
+                     if recent_new_high_result and recent_new_high_result[0]:
+                         stock_data['recent_new_high_date'] = recent_new_high_result[0]
+
+                 stocks.append(stock_data)
 
             logger.info(f"[DEBUG] 最终返回股票数: {len(stocks)}")
             conn.close()
@@ -1456,6 +1529,235 @@ class RotationAnalysisDB:
         except Exception as e:
             logger.error(f"获取题材活跃标的失败: {e}", exc_info=True)
             return []
+
+    def get_topic_trend_stocks(self, topic_name: str, days: int = 24) -> Dict:
+        """获取题材的趋势标历史（近N个交易日中的趋势标的入选数据）
+
+        参数说明：
+        - topic_name: 题材名称
+        - days: 近多少个交易日（默认24个）
+
+        返回值：
+        - 按入选次数分组的趋势标数据
+        """
+        try:
+            logger.info(f"[DEBUG] get_topic_trend_stocks 开始: topic_name={topic_name}, days={days}")
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # 获取题材ID
+            cursor.execute('SELECT topic_id FROM topics WHERE topic_name = ?', (topic_name,))
+            topic_result = cursor.fetchone()
+            if not topic_result:
+                logger.warning(f"[DEBUG] 题材不存在: topic_name={topic_name}")
+                conn.close()
+                return {"by_count": {}, "by_date": {}}
+            topic_id = topic_result[0]
+            logger.info(f"[DEBUG] 找到题材: topic_id={topic_id}")
+
+            # 从topic_stock_relations获取该题材关联的所有stock_id（持久关联）
+            cursor.execute('''
+                SELECT DISTINCT stock_id
+                FROM topic_stock_relations
+                WHERE topic_id = ?
+            ''', (topic_id,))
+            stock_ids = [row[0] for row in cursor.fetchall()]
+            logger.info(f"[DEBUG] 题材关联的stock_id数量: {len(stock_ids)}")
+
+            if not stock_ids:
+                logger.warning(f"[DEBUG] 题材没有关联的股票")
+                conn.close()
+                return {"by_count": {}, "by_date": {}}
+
+            # 获取最近N个交易日
+            cursor.execute('''
+                SELECT DISTINCT trade_date
+                FROM trend_stocks
+                ORDER BY trade_date DESC
+                LIMIT ?
+            ''', (days,))
+            trading_dates = [row[0] for row in cursor.fetchall()]
+            logger.info(f"[DEBUG] trading_dates: {len(trading_dates)}个")
+
+            if not trading_dates:
+                logger.warning(f"[DEBUG] 没有趋势标数据")
+                conn.close()
+                return {"by_count": {}, "by_date": {}}
+
+            date_placeholders = ','.join(['?' for _ in trading_dates])
+            placeholders = ','.join(['?' for _ in stock_ids])
+
+            # 查询这些股票的趋势标数据
+            query = f'''
+                SELECT
+                    s.stock_code,
+                    s.stock_name,
+                    ts.trade_date,
+                    ts.total_score,
+                    ts.change_pct_60d
+                FROM trend_stocks ts
+                JOIN stocks s ON ts.stock_id = s.stock_id
+                WHERE ts.trade_date IN ({date_placeholders})
+                  AND s.stock_id IN ({placeholders})
+                ORDER BY ts.trade_date DESC
+            '''
+
+            cursor.execute(query, trading_dates + stock_ids)
+            trend_rows = cursor.fetchall()
+            logger.info(f"[DEBUG] 获取到 {len(trend_rows)} 条趋势标记录")
+
+            import struct
+
+            # 查询所有涨停数据
+            query_limits = f'''
+                SELECT
+                    s.stock_code,
+                    COUNT(*) as limit_count
+                FROM first_limits fl
+                JOIN stocks s ON fl.stock_id = s.stock_id
+                WHERE fl.limit_date IN ({date_placeholders})
+                  AND s.stock_id IN ({placeholders})
+                GROUP BY s.stock_id
+            '''
+
+            cursor.execute(query_limits, trading_dates + stock_ids)
+            limit_rows = cursor.fetchall()
+
+            # 构建涨停次数字典
+            limit_count_map = {}
+            for code, count in limit_rows:
+                limit_count_map[code] = count
+
+            logger.info(f"[DEBUG] 涨停数据 {len(limit_count_map)} 只股票")
+
+            # 查询所有新高数据
+            query_highs = f'''
+                SELECT
+                    s.stock_code,
+                    COUNT(*) as new_high_count
+                FROM popularity_stocks ps
+                JOIN stocks s ON ps.stock_id = s.stock_id
+                WHERE ps.trade_date IN ({date_placeholders})
+                  AND ps.source_id = 9
+                  AND s.stock_id IN ({placeholders})
+                GROUP BY s.stock_id
+            '''
+
+            cursor.execute(query_highs, trading_dates + stock_ids)
+            high_rows = cursor.fetchall()
+
+            # 构建新高次数字典
+            new_high_count_map = {}
+            for code, count in high_rows:
+                new_high_count_map[code] = count
+
+            logger.info(f"[DEBUG] 新高数据 {len(new_high_count_map)} 只股票")
+
+            conn.close()
+
+            # 按股票整理入选记录
+            stock_selections = {}
+
+            for row in trend_rows:
+                code, name, date, score, change_pct_60d = row
+
+                # 只处理有效记录（score > 0）
+                if score <= 0:
+                    continue
+
+                # 处理 change_pct_60d（可能是二进制数据）
+                try:
+                    if isinstance(change_pct_60d, bytes):
+                        change_pct_60d = struct.unpack('d', change_pct_60d)[0]
+                except:
+                    change_pct_60d = None
+
+                if code not in stock_selections:
+                    stock_selections[code] = {
+                        "code": code,
+                        "name": name,
+                        "selection_dates": [],
+                        "scores": [],
+                        "changes_60d": [],
+                        "limit_count": limit_count_map.get(code, 0),
+                        "new_high_count": new_high_count_map.get(code, 0)
+                    }
+
+                stock_selections[code]["selection_dates"].append(date)
+                stock_selections[code]["scores"].append(score)
+                stock_selections[code]["changes_60d"].append(change_pct_60d)
+
+            # 按入选次数分类
+            by_count = {}
+
+            for code, data in stock_selections.items():
+                count = len(data["selection_dates"])
+
+                # 计算统计数据
+                selection_count = count
+                recent_date = max(data["selection_dates"]) if data["selection_dates"] else None
+                recent_score = None
+                latest_60d_change = None
+
+                # 找到最新日期的得分和涨幅
+                for i, date in enumerate(data["selection_dates"]):
+                    if date == recent_date:
+                        recent_score = data["scores"][i]
+                        latest_60d_change = data["changes_60d"][i]
+                        break
+
+                if count not in by_count:
+                    by_count[count] = []
+
+                by_count[count].append({
+                    "code": data["code"],
+                    "name": data["name"],
+                    "selection_count": selection_count,
+                    "selection_dates": data["selection_dates"],
+                    "scores": data["scores"],
+                    "changes_60d": data["changes_60d"],
+                    "recent_score": recent_score,
+                    "latest_60d_change": latest_60d_change,
+                    "limit_count": data["limit_count"],
+                    "new_high_count": data["new_high_count"]
+                })
+
+            # 按日期分类（每只股票只在最近入选日期显示）
+            by_date = {}
+            for code, data in stock_selections.items():
+                # 找到最近入选日期
+                recent_date = max(data["selection_dates"]) if data["selection_dates"] else None
+
+                if recent_date:
+                    if recent_date not in by_date:
+                        by_date[recent_date] = []
+
+                    # 找到对应日期的索引
+                    recent_index = data["selection_dates"].index(recent_date)
+
+                    by_date[recent_date].append({
+                        "code": data["code"],
+                        "name": data["name"],
+                        "recent_score": data["scores"][recent_index],
+                        "latest_60d_change": data["changes_60d"][recent_index],
+                        "limit_count": data["limit_count"],
+                        "new_high_count": data["new_high_count"]
+                    })
+
+            # 按次数从高到低排序
+            by_count_sorted = {}
+            for count in sorted(by_count.keys(), reverse=True):
+                by_count_sorted[count] = by_count[count]
+
+            logger.info(f"[DEBUG] 完成，共{len(by_count_sorted)}个入选次数分组，{len(by_date)}个日期，{len(stock_selections)}只股票")
+
+            return {
+                "by_count": by_count_sorted,
+                "by_date": by_date
+            }
+        except Exception as e:
+            logger.error(f"获取题材趋势标失败: {e}", exc_info=True)
+            return {"by_count": {}, "by_date": {}}
 
     def remove_topic_activation(self, topic_id: int, date: str) -> bool:
         """移除题材激活（删除某日题材卡片）
@@ -1558,17 +1860,31 @@ class RotationAnalysisDB:
             logger.error(f"删除题材失败: {e}")
             return False
 
-    def get_activated_topics(self, date: str) -> List[Dict]:
-        """获取指定日期激活的题材列表"""
+    def get_activated_topics(self, date: str, table: str = None) -> List[Dict]:
+        """获取指定日期激活的题材列表
+
+        参数:
+        - date: 查询日期
+        - table: 指定表名（None=自动判断）
+                - "topic_activations" 或 "topic_activations_tmp"
+
+        返回:
+        - 题材列表
+        """
+        # 如果未指定表，根据时间自动判断
+        if table is None:
+            from src.main import is_in_trading_hours
+            table = "topic_activations_tmp" if is_in_trading_hours() else "topic_activations"
+
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            cursor.execute('''
+            cursor.execute(f'''
                 SELECT
                     ta.topic_id,
                     t.topic_name
-                FROM topic_activations ta
+                FROM {table} ta
                 JOIN topics t ON ta.topic_id = t.topic_id
                 WHERE ta.activation_date = ? AND ta.is_active = 1
                 ORDER BY t.topic_name
@@ -1632,8 +1948,13 @@ class RotationAnalysisDB:
             logger.error(f"获取激活题材列表失败: {e}")
             return []
 
-    def get_topic_first_limits_by_association_date(self, topic_id: int, association_date: str) -> List[Dict]:
-        """获取指定题材在指定关联日期的首板标的（从 first_limit_topics 表查询）
+    def get_topic_first_limits_by_association_date(
+        self,
+        topic_id: int,
+        association_date: str,
+        table: str = None
+    ) -> List[Dict]:
+        """获取指定题材在指定关联日期的首板标的
 
         首板板块核心逻辑（重要！）：
         - 使用 association_date 过滤（首板与题材的真实活跃交易日）
@@ -1642,17 +1963,27 @@ class RotationAnalysisDB:
         参数说明：
         - topic_id: 题材ID
         - association_date: 关联日期（从全局displayTradeDate获取）
+        - table: 指定表名（None=自动判断）
+                - "first_limit_topics" 或 "first_limit_topics_tmp"
 
         应用场景：
         - 周日复盘周五盘面，将某个首板拖入题材
         - association_date = "2025-02-02"（周五）
         - 查询该日期的题材卡片时，使用此方法获取关联的首板
         """
+        # 如果未指定表，根据时间自动判断
+        if table is None:
+            from src.main import is_in_trading_hours
+            table = "first_limit_topics_tmp" if is_in_trading_hours() else "first_limit_topics"
+
+        # 从题材关联表推断首板表
+        first_limits_table = table.replace('_topics', 's')
+
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            cursor.execute('''
+            cursor.execute(f'''
                 SELECT
                     fl.id,
                     fl.stock_id,
@@ -1666,9 +1997,9 @@ class RotationAnalysisDB:
                     fl.limit_type,
                     fl.amount,
                     fl.reason,
-                    fl.is_exploded
-                FROM first_limit_topics flt
-                JOIN first_limits fl ON flt.first_limit_id = fl.id
+                    coalesce(fl.is_exploded, 0) as is_exploded
+                FROM {table} flt
+                JOIN {first_limits_table} fl ON flt.first_limit_id = fl.id
                 JOIN stocks s ON fl.stock_id = s.stock_id
                 WHERE flt.topic_id = ? AND flt.association_date = ?
                 ORDER BY fl.first_limit_time
@@ -2708,6 +3039,199 @@ class RotationAnalysisDB:
             logger.error(f"保存人气榜标的失败: {e}")
             return 0
 
+    def get_strong_stock_types(self) -> List[Dict]:
+        """获取强势股热度类型列表
+
+        关联关系：
+        - 被main.py的get_strong_stocks API endpoint调用
+        - 返回strong_stock_types表数据
+        过滤说明：获取所有活跃的强势股热度类型
+
+        Returns:
+            热度类型列表，每个类型包含：
+            - type_id: 类型ID
+            - type_name: 类型名称
+            - description: 描述
+            - sort_order: 排序
+            - is_active: 是否活跃
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT type_id, type_name, description, sort_order, is_active
+                FROM strong_stock_types
+                WHERE is_active = 1
+                ORDER BY sort_order, type_id
+            ''')
+
+            types = []
+            for row in cursor.fetchall():
+                types.append({
+                    'type_id': row[0],
+                    'type_name': row[1],
+                    'description': row[2],
+                    'sort_order': row[3],
+                    'is_active': row[4]
+                })
+
+            conn.close()
+            return types
+
+        except Exception as e:
+            logger.error(f"获取强势股热度类型失败: {e}")
+            return []
+
+    def get_strong_stocks(self, hot_type: str = None, trade_date: str = None) -> List[Dict]:
+        """获取强势股数据
+
+        关联关系：
+        - 被main.py的get_strong_stocks API endpoint调用
+        - 查询strong_stocks表
+        过滤说明：
+        - 如果指定hot_type，返回该热度类型的强势股
+        - 如果不指定hot_type，返回所有强势股
+
+        Args:
+            hot_type: 热度类型（如'60日新高'），不传则返回所有类型
+            trade_date: 交易日期（格式：YYYY-MM-DD），不传则返回最新
+
+        Returns:
+            强势股列表，每个股票包含：
+            - id: 记录ID
+            - stock_id: 股票ID
+            - code: 股票代码
+            - name: 股票名称
+            - trade_date: 交易日期
+            - hot_type: 热度类型
+            - rank: 排名
+            - price: 股票价格
+            - change_percent: 涨跌幅
+            - amount: 成交额
+            - turnover_rate: 换手率
+            - volume_ratio: 量比
+            - is_new_high: 是否新高
+            - continuous_limit_days: 连续涨停天数
+            - sector: 行业
+            - reason: 原因
+            - topics: 题材列表(最近异动的题材)
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            if hot_type:
+                cursor.execute('''
+                    SELECT ss.id, ss.stock_id, s.stock_code, s.stock_name, s.industry,
+                           ss.trade_date, ss.hot_type, ss.rank, ss.price, ss.change_percent,
+                           ss.amount, ss.turnover_rate, ss.volume_ratio, ss.is_new_high,
+                           ss.continuous_limit_days, ss.sector, ss.reason
+                    FROM strong_stocks ss
+                    JOIN stocks s ON ss.stock_id = s.stock_id
+                    WHERE ss.hot_type = ?
+                    AND ss.trade_date = ?
+                    ORDER BY ss.rank
+                ''', (hot_type, trade_date))
+            else:
+                cursor.execute('''
+                    SELECT ss.id, ss.stock_id, s.stock_code, s.stock_name, s.industry,
+                           ss.trade_date, ss.hot_type, ss.rank, ss.price, ss.change_percent,
+                           ss.amount, ss.turnover_rate, ss.volume_ratio, ss.is_new_high,
+                           ss.continuous_limit_days, ss.sector, ss.reason
+                    FROM strong_stocks ss
+                    JOIN stocks s ON ss.stock_id = s.stock_id
+                    WHERE ss.trade_date = ?
+                    ORDER BY ss.hot_type, ss.rank
+                ''', (trade_date,))
+
+            stocks = []
+            for row in cursor.fetchall():
+                stock_id = row[1]
+                stocks.append({
+                    'id': row[0],
+                    'stock_id': stock_id,
+                    'code': row[2],
+                    'name': row[3],
+                    'industry': row[4],
+                    'trade_date': row[5],
+                    'hot_type': row[6],
+                    'rank': row[7],
+                    'price': row[8],
+                    'change_percent': row[9],
+                    'amount': row[10],
+                    'turnover_rate': row[11],
+                    'volume_ratio': row[12],
+                    'is_new_high': row[13],
+                    'continuous_limit_days': row[14],
+                    'sector': row[15],
+                    'reason': row[16],
+                    'topics': []
+                })
+
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            for stock in stocks:
+                stock_id = stock['stock_id']
+                cursor.execute('''
+                    SELECT t.topic_name, tsr.date
+                    FROM topic_stock_relations tsr
+                    JOIN topics t ON tsr.topic_id = t.topic_id
+                    WHERE tsr.stock_id = ?
+                    AND tsr.date <= ?
+                    AND tsr.is_active = 1
+                    ORDER BY tsr.date DESC, tsr.create_time DESC
+                    LIMIT 1
+                ''', (stock_id, trade_date))
+
+                result = cursor.fetchone()
+                if result and result[0]:
+                    stock['topics'] = [result[0]]
+                else:
+                    stock['topics'] = []
+
+            conn.close()
+            return stocks
+
+        except Exception as e:
+            logger.error(f"获取强势股失败: {e}")
+            return []
+
+    def create_strong_stock_type(self, type_name: str, description: str = '', sort_order: int = 0) -> int:
+        """创建强势股热度类型
+
+        Args:
+            type_name: 类型名称
+            description: 描述
+            sort_order: 排序
+
+        Returns:
+            type_id: 类型ID，失败返回-1
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            now = datetime.now().isoformat()
+
+            cursor.execute('''
+                INSERT INTO strong_stock_types
+                (type_name, description, sort_order, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+            ''', (type_name, description, sort_order, now, now))
+
+            type_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+
+            logger.info(f"创建强势股热度类型: type_id={type_id}, type_name={type_name}")
+            return type_id
+
+        except Exception as e:
+            logger.error(f"创建强势股热度类型失败: {e}")
+            return -1
+
     def get_amount_types(self) -> List[Dict]:
         """获取所有成交额榜类型（选项卡）"""
         try:
@@ -2921,3 +3445,354 @@ class RotationAnalysisDB:
         except Exception as e:
             logger.error(f"标记成交额榜为final失败: {e}")
             return False
+
+    def clear_first_limits_tmp_tables(self) -> None:
+        """清空所有临时表数据（盘中数据）
+
+        清空内容：
+        - first_limits_tmp（首板临时数据）
+        - first_limit_topics_tmp（题材关联临时数据）
+        - topic_activations_tmp（题材激活临时数据）
+
+        业务场景：
+        - 盘中：每次刷新前清空（准备全量覆盖）
+        - 盘后/非交易日：清空临时表（临时数据视为错误数据）
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # 清空首板临时表
+            cursor.execute('DELETE FROM first_limits_tmp')
+            deleted_limits = cursor.rowcount
+
+            # 清空题材关联临时表
+            cursor.execute('DELETE FROM first_limit_topics_tmp')
+            deleted_relations = cursor.rowcount
+
+            # 清空题材激活临时表
+            cursor.execute('DELETE FROM topic_activations_tmp')
+            deleted_activations = cursor.rowcount
+
+            conn.commit()
+            conn.close()
+
+            logger.info(f"清空临时表完成: "
+                       f"首板{deleted_limits}条, 关联{deleted_relations}条, 激活{deleted_activations}条")
+
+        except Exception as e:
+            logger.error(f"清空临时表失败: {e}", exc_info=True)
+
+    def save_first_limits_to_specific_table(self, data_list, table: str, date: str) -> int:
+        """保存首板数据到指定表（临时表或正式表）
+
+        参数:
+        - data_list: 首板数据列表
+        - table: 目标表名（"first_limits" 或 "first_limits_tmp"）
+        - date: 查询日期
+
+        返回:
+        - 保存的记录数
+
+        业务场景：
+        - 盘中：保存到 first_limits_tmp
+        - 盘后/非交易日：保存到 first_limits
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            saved_count = 0
+
+            for stock in data_list:
+                # 获取或创建股票记录（注意：使用外部连接，不支持 con/cursor 参数）
+                stock_id = self.get_or_create_stock(
+                    stock.get('code', ''),
+                    stock.get('name', ''),
+                    stock.get('sector', '')
+                )
+
+                if stock_id == -1:
+                    continue
+
+                # 插入首板记录（使用 INSERT OR REPLACE 实现覆盖）
+                cursor.execute(f'''
+                    INSERT OR REPLACE INTO {table}
+                    (stock_id, limit_date, first_limit_time, limit_price,
+                     open_price, amount, limit_type, reason, source, create_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    stock_id,
+                    date,
+                    stock.get('first_time', ''),
+                    stock.get('price', 0),
+                    stock.get('open_price', 0),
+                    stock.get('amount', 0),
+                    stock.get('limit_type', '10%'),
+                    stock.get('reason', ''),
+                    stock.get('source', 'akshare'),
+                    datetime.now().isoformat()
+                ))
+
+                saved_count += 1
+
+            conn.commit()
+            conn.close()
+
+            logger.info(f"保存首板数据到 {table}: {saved_count} 条")
+            return saved_count
+
+        except Exception as e:
+            logger.error(f"保存首板数据失败: {e}", exc_info=True)
+            return 0
+
+    def check_first_limits_date_exists(self, date: str, table: str = "first_limits") -> bool:
+        """检查指定日期在首板表中是否有数据
+
+        参数:
+        - date: 查询日期
+        - table: 指定表名（默认正式表）
+
+        返回:
+        - True=有数据，False=无数据
+        
+        业务场景：
+        - 盘外刷新前检查正式表是否已有数据
+        - 如果有数据，不自动创建题材（保护用户手动操作）
+        - 如果没有数据，自动创建题材（初始化）
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute(f'''
+                SELECT COUNT(*)
+                FROM {table}
+                WHERE limit_date = ?
+            ''', (date,))
+
+            count = cursor.fetchone()[0]
+
+            conn.close()
+
+            has_data = count > 0
+
+            logger.info(f"检查 {table} 日期 {date} 是否有数据: {has_data} ({count} 条)")
+
+            return has_data
+
+        except Exception as e:
+            logger.error(f"检查首板数据是否存在失败: {e}")
+            return False
+
+    def check_topic_activations_date_exists(self, date: str, table: str = "topic_activations") -> bool:
+        """检查指定日期在题材激活表中是否有数据
+
+        参数:
+        - date: 查询日期
+        - table: 指定表名（默认正式表）
+
+        返回:
+        - True=有题材卡片，False=无题材卡片
+        
+        业务场景：
+        - 盘外刷新前检查正式表是否已有题材卡片
+        - 如果有题材卡片，不自动创建（保护用户手动操作，如删除的题材）
+        - 如果没有题材卡片，自动创建（初始化）
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute(f'''
+                SELECT COUNT(*)
+                FROM {table}
+                WHERE activation_date = ?
+            ''', (date,))
+
+            count = cursor.fetchone()[0]
+
+            conn.close()
+
+            has_activations = count > 0
+
+            logger.info(f"检查 {table} 日期 {date} 是否有题材卡片: {has_activations} ({count} 个)")
+
+            return has_activations
+
+        except Exception as e:
+            logger.error(f"检查题材激活是否存在失败: {e}")
+            return False
+
+    def auto_create_topic_cards_for_date(
+        self,
+        date: str,
+        topics_table: str,
+        activations_table: str,
+        first_limits_table: str = None
+    ) -> List[Dict]:
+        """自动创建题材卡片并归类首板标的
+
+        流程:
+        1. 查询指定日期的所有首板（从 first_limits_table）
+        2. 查询每个首板股票在 topic_stock_relations 中的题材关联
+        3. 对于每个题材：
+           - 激活题材卡片（写入 activations_table）
+           - 关联首板到题材（写入 topics_table）
+        4. 清理无效题材（没有首板关联的）
+
+        参数:
+        - date: 查询日期
+        - topics_table: 题材关联表名（first_limit_topics 或 first_limit_topics_tmp）
+        - activations_table: 题材激活表名（topic_activations 或 topic_activations_tmp）
+        - first_limits_table: 首板表名（可选，默认与 topics_table 对应）
+
+        返回:
+        - 激活的题材列表 [{'topic_id': int, 'topic_name': str}]
+        """
+        try:
+            # 如果未指定首板表，从题材表推断
+            if first_limits_table is None:
+                first_limits_table = topics_table.replace('_topics', 's')
+
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # 步骤1: 查询指定日期的首板
+            cursor.execute(f'''
+                SELECT DISTINCT stock_id
+                FROM {first_limits_table}
+                WHERE limit_date = ?
+            ''', (date,))
+
+            stock_ids = [row[0] for row in cursor.fetchall()]
+
+            if not stock_ids:
+                logger.info(f"日期 {date} 没有首板数据，无需创建题材卡片")
+                return []
+
+            logger.info(f"[自动创建题材] 开始为 {len(stock_ids)} 只首板创建题材卡片...")
+
+            # 步骤2: 查询每个股票的题材关联（从 topic_stock_relations）
+            placeholders = ','.join(['?' for _ in stock_ids])
+            cursor.execute(f'''
+                SELECT DISTINCT
+                    tsr.topic_id,
+                    t.topic_name
+                FROM topic_stock_relations tsr
+                JOIN topics t ON tsr.topic_id = t.topic_id
+                WHERE tsr.stock_id IN ({placeholders})
+                ORDER BY t.topic_name
+            ''', stock_ids)
+
+            topic_rows = cursor.fetchall()
+            topic_map = {row[0]: row[1] for row in topic_rows}
+            topic_ids = list(topic_map.keys())
+
+            logger.info(f"[自动创建题材] 发现 {len(topic_ids)} 个题材需要处理")
+
+            if not topic_ids:
+                logger.info(f"[自动创建题材] 没有发现题材关联")
+                return []
+
+            # 步骤3: 激活题材卡片
+            activated_topics = []
+            for topic_id in topic_ids:
+                topic_name = topic_map[topic_id]
+
+                # 检查是否已激活
+                cursor.execute(f'''
+                    SELECT id FROM {activations_table}
+                    WHERE topic_id = ? AND activation_date = ?
+                ''', (topic_id, date))
+
+                if not cursor.fetchone():
+                    # 激活题材
+                    now = datetime.now().isoformat()
+                    cursor.execute(f'''
+                        INSERT OR IGNORE INTO {activations_table}
+                        (topic_id, activation_date, is_active, created_at, updated_at)
+                        VALUES (?, ?, 1, ?, ?)
+                    ''', (topic_id, date, now, now))
+
+                    activated_topics.append({
+                        'topic_id': topic_id,
+                        'topic_name': topic_name
+                    })
+                    logger.info(f"[自动创建题材] 激活题材: {topic_name}")
+
+            # 步骤4: 关联首板到题材
+            # 先查询哪些股票-题材组合需要关联
+            stock_placeholders = ','.join(['?' for _ in stock_ids])
+            topic_placeholders = ','.join(['?' for _ in topic_ids])
+            
+            cursor.execute(f'''
+                SELECT DISTINCT
+                    tsr.stock_id,
+                    tsr.topic_id
+                FROM topic_stock_relations tsr
+                WHERE tsr.stock_id IN ({stock_placeholders})
+                  AND tsr.topic_id IN ({topic_placeholders})
+            ''', stock_ids + topic_ids)
+
+            stock_topic_pairs = cursor.fetchall()
+            关联_count = 0
+
+            for stock_id, topic_id in stock_topic_pairs:
+                # 检查该股票在指定日期是否是首板
+                cursor.execute(f'''
+                    SELECT id FROM {first_limits_table}
+                    WHERE stock_id = ? AND limit_date = ?
+                ''', (stock_id, date))
+
+                limit_record = cursor.fetchone()
+
+                if limit_record:
+                    first_limit_id = limit_record[0]
+
+                    # 插入到题材关联表
+                    cursor.execute(f'''
+                        INSERT OR IGNORE INTO {topics_table}
+                        (stock_id, first_limit_id, topic_id, create_time, association_date)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (
+                        stock_id,
+                        first_limit_id,
+                        topic_id,
+                        datetime.now().isoformat(),
+                        date
+                    ))
+                    关联_count += 1
+
+            # 步骤5: 清理无效题材（没有首板关联的）
+            cursor.execute(f'''
+                SELECT DISTINCT ta.topic_id, t.topic_name
+                FROM {activations_table} ta
+                JOIN topics t ON ta.topic_id = t.topic_id
+                WHERE ta.activation_date = ?
+                AND ta.topic_id NOT IN (
+                    SELECT DISTINCT topic_id FROM {topics_table}
+                    WHERE association_date = ?
+                )
+            ''', (date, date))
+
+            invalid_topics = cursor.fetchall()
+
+            for topic_id, topic_name in invalid_topics:
+                cursor.execute(f'''
+                    DELETE FROM {activations_table}
+                    WHERE topic_id = ? AND activation_date = ?
+                ''', (topic_id, date))
+                logger.info(f"[自动创建题材] 删除无效题材: {topic_name}")
+
+            conn.commit()
+            conn.close()
+
+            logger.info(f"[自动创建题材] 完成: "
+                       f"激活{len(activated_topics)}个, 关联{关联_count}个, 删除{len(invalid_topics)}个")
+
+            return activated_topics
+
+        except Exception as e:
+            logger.error(f"自动创建题材卡片失败: {e}", exc_info=True)
+            return []

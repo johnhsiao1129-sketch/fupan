@@ -10,6 +10,8 @@ import json
 import logging
 import os
 import random
+import sqlite3
+import struct
 from datetime import datetime, timedelta, time
 import akshare as ak
 import pandas as pd
@@ -25,12 +27,13 @@ from db_operations import (
     get_trading_days_between
 )
 from market_mood_calculator import MarketMoodCalculator
+from data.database import DB_PATH
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="A股复盘系统",
+    title="A股复盘工具",
     description="专业A股复盘分析系统 - AkShare数据源",
     version="2.0.0"
 )
@@ -75,6 +78,54 @@ async def startup_event():
             logger.error(f"初始化人气榜数据源失败 {source_name}: {e}")
 
     logger.info("服务启动完成")
+
+
+def is_in_trading_hours() -> bool:
+    """判断当前是否在交易时段（9:25-15:00）
+
+    条件：
+    1. 必须是交易日
+    2. 时间在 9:25 ~ 15:00 之间
+
+    Returns:
+        bool: True=在交易时段，False=不在交易时段
+    """
+    now = datetime.now()
+    today = now.date().strftime("%Y-%m-%d")
+    current_time = now.time()
+
+    # 交易时段判断
+    market_start = time(9, 25, 0)
+    market_end = time(15, 0, 0)
+
+    # 检查时间是否在交易时段
+    if not (market_start <= current_time < market_end):
+        logger.debug(f"当前时间 {current_time} 不在交易时段（9:25-15:00）")
+        return False
+
+    # 检查今天是否是交易日
+    try:
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT is_active FROM trading_days
+            WHERE date = ?
+        ''', (today,))
+        result = cursor.fetchone()
+        conn.close()
+
+        is_trading_day = result and result[0] == 1
+
+        if is_trading_day:
+            logger.debug(f"今天 {today} 是交易日，当前在交易时段")
+        else:
+            logger.debug(f"今天 {today} 不是交易日")
+
+        return is_trading_day
+
+    except Exception as e:
+        logger.error(f"检查是否交易日失败: {e}")
+        return False
 
 
 def get_query_trading_date() -> str:
@@ -437,8 +488,8 @@ class StockDataService:
                             if mood_result['success']:
                                 mood_score = mood_result['total_score']
                                 mood_name = mood_result['mood_name']
-                                # 图表显示时应用下限，避免极端数值影响可视化
-                                mood_score = max(mood_score, -30)
+                                # 注意：不再在后端 clip mood_score。前端 moodChart 渲染时会在 Y 轴范围 clip 到 -40，
+                                # 但 points[].score（用于 tooltip 显示）保持真实值，不丢失信息
                         except Exception as e:
                             logger.warning(f"计算{date}情绪分数失败: {e}")
 
@@ -1316,14 +1367,22 @@ async def save_limit_analysis(
 
 
 @app.post("/api/limit-stats/refresh")
-async def refresh_limit_statistics(targetDate: str = Body(..., embed=True, description="要刷新的目标日期")):
+async def refresh_limit_statistics(
+    targetDate: str = Body(..., embed=True, description="要刷新的目标日期"),
+    forceRecreateTopics: bool = Body(False, description="强制重建题材卡片（忽略已有数据保护）")
+):
     """手动刷新涨停统计数据（用户主动触发）
 
-    当用户点击刷新按钮时调用此API，
-    会使用用户通过日期选择器选择的日期获取涨停数据并保存到数据库
+    业务逻辑：
+    - 盘中：不获取数据，不创建题材卡片，提醒使用"📡 盘中刷新"按钮
+    - 盘后：获取数据，自动创建题材卡片，联动刷新今日首板板块
+    - 总是使用正式表（first_limits、topic_activations 等）
+    - 清空临时表（临时数据视为错误数据）
+    - 用于连板梯队等板块的盘后数据刷新
 
     Args:
         targetDate: 用户通过日期选择器选择的目标日期（格式：YYYY-MM-DD）
+        forceRecreateTopics: 是否强制重建题材卡片（True=强制重建，False=保护已有数据）
     """
     try:
         from src.data_acquisition import DataAcquisitionService
@@ -1331,17 +1390,86 @@ async def refresh_limit_statistics(targetDate: str = Body(..., embed=True, descr
         logger.info("手动刷新涨停数据开始")
         logger.info(f"用户选择的刷新日期: {targetDate}")
 
+        # 判断是否在交易时段
+        in_trading = is_in_trading_hours()
+        logger.info(f"当前是否在交易时段: {in_trading}")
+
+        if in_trading:
+            # ===== 盘中情景 =====
+            # 不获取数据，不创建题材卡片
+            logger.info(f"[刷新] 盘中时段，不获取数据，请使用今日首板的'📡 盘中刷新'按钮")
+            return {
+                "success": True,
+                "message": "当前为交易时段（9:25-15:00），请使用今日首板板块的'📡 盘中刷新'按钮获取盘中数据",
+                "is_trading": True,
+                "using_tmp_table": False,
+                "auto_created_topics": False,
+                "auto_create_reason": "盘中时段不自动创建",
+                "activated_topics": [],
+                "activated_topics_count": 0,
+                "refresh_today_first_limits": False  # 不联动刷新今日首板
+            }
+
+        # ===== 盘外情景 =====
         service = DataAcquisitionService()
 
-        # 直接使用用户传递的日期进行查询和保存
-        result = service.fetch_and_save_limit_data(targetDate)
+        # 清空临时表（临时数据视为错误数据）
+        db.clear_first_limits_tmp_tables()
 
-        logger.info(f"手动刷新涨停数据完成: {result}")
-        
+        # 确定查询日期
+        if targetDate:
+            query_date = targetDate
+        else:
+            query_date = get_query_trading_date()
+
+        # 在刷新数据前检查正式表是否已有题材卡片
+        has_activations_before_refresh = db.check_topic_activations_date_exists(query_date, table="topic_activations")
+
+        # 获取数据（总是使用正式表）
+        raw_result = service.fetch_and_save_limit_data(query_date, use_tmp_table=False)
+
+        logger.info(f"手动刷新涨停数据完成: {raw_result}")
+
+        # ===== 判断是否需要自动创建题材 =====
+        # 规则：
+        # 1. 检查 topic_activations 是否已有该日期的题材卡片
+        # 2. 没有题材卡片：自动创建（初始化）
+        # 3. 有题材卡片：不自动创建（保护用户手动操作，如删除的题材卡片）
+        # 4. 强制重建参数会覆盖上述规则
+        auto_create = False
+
+        if forceRecreateTopics:
+            # 强制重建：忽略已有数据保护
+            auto_create = True
+            logger.info(f"[刷新] 强制重建模式，执行自动创建题材")
+        else:
+            # 正常模式：使用刷新前的检查结果
+            auto_create = not has_activations_before_refresh
+
+            if not auto_create:
+                logger.info(f"[刷新] 正式表已有 {query_date} 的题材卡片，跳过自动创建（保护用户手动操作）")
+            else:
+                logger.info(f"[刷新] 正式表没有 {query_date} 的题材卡片，执行自动创建（初始化）")
+
+        # ===== 自动创建题材卡片 =====
+        activated_topics = []
+
+        if auto_create:
+            logger.info(f"[刷新] 自动创建题材卡片")
+            activated_topics = db.auto_create_topic_cards_for_date(
+                query_date,
+                topics_table="first_limit_topics",
+                activations_table="topic_activations",
+                first_limits_table="first_limits"
+            )
+
+            logger.info(f"[刷新] 激活题材: {len(activated_topics)} 个")
+        else:
+            logger.info(f"[刷新] 跳过自动创建题材卡片")
+
         # 检查是否需要提示新高数据限制
         high_data_updated = True  # 默认认为有更新
         if targetDate:
-            # 获取最新交易日
             try:
                 from data.db_operations import get_latest_trading_date_from_db
                 latest_trading_date = get_latest_trading_date_from_db()
@@ -1349,21 +1477,105 @@ async def refresh_limit_statistics(targetDate: str = Body(..., embed=True, descr
                     high_data_updated = False
             except Exception as e:
                 logger.warning(f"检查新高数据更新状态失败: {e}")
-        
-        return {
-            "success": result.get("success", False) or (result.get("first_limit_count", 0) > 0 or result.get("continuous_limit_count", 0) > 0),
-            "message": result.get("message", ""),
-            "first_limit_count": result.get("first_limit_count", 0),
-            "continuous_limit_count": result.get("continuous_limit_count", 0),
-            "exploded_count": result.get("exploded_count", 0),
-            "limit_down_count": result.get("limit_down_count", 0),
-            "total_records": result.get("total_records", 0),
-            "trade_date": targetDate,
+
+        result = {
+            "success": raw_result.get("success", False) or (raw_result.get("first_limit_count", 0) > 0 or raw_result.get("continuous_limit_count", 0) > 0),
+            "message": raw_result.get("message", ""),
+            "first_limit_count": raw_result.get("first_limit_count", 0),
+            "continuous_limit_count": raw_result.get("continuous_limit_count", 0),
+            "exploded_count": raw_result.get("exploded_count", 0),
+            "limit_down_count": raw_result.get("limit_down_count", 0),
+            "total_records": raw_result.get("total_records", 0),
+            "trade_date": query_date,
             "high_data_updated": high_data_updated,
-            "high_data_message": "新高数据已更新" if high_data_updated else "新高数据未更新（仅支持刷新最新交易日）"
+            "high_data_message": "新高数据已更新" if high_data_updated else "新高数据未更新（仅支持刷新最新交易日）",
+            "is_trading": False,
+            "using_tmp_table": False,  # 总是使用正式表
+            "auto_created_topics": auto_create,
+            "auto_create_reason": ("强制重建" if forceRecreateTopics else 
+                                  "初始化" if auto_create else 
+                                  "保护用户手动操作"),
+            "activated_topics": activated_topics,
+            "activated_topics_count": len(activated_topics),
+            "had_activations_before_refresh": has_activations_before_refresh,
+            "refresh_today_first_limits": True  # 联动刷新今日首板板块
         }
+
+        return result
     except Exception as e:
         logger.error(f"手动刷新涨停数据失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/limit-stats/intraday-refresh")
+async def refresh_intraday_data(targetDate: str = Body(..., embed=True, description="要刷新的目标日期")):
+    """盘中刷新今日首板数据（使用临时表）
+
+    业务逻辑：
+    - 仅在交易时段可用
+    - 使用临时表（first_limits_tmp、topic_activations_tmp 等）
+    - 刷新当前交易日的数据
+    - 总是自动创建题材卡片（因为盘中数据会变化）
+
+    Args:
+        targetDate: 用户通过日期选择器选择的目标日期（格式：YYYY-MM-DD），用于今日首板板块
+    """
+    try:
+        # 检查是否在交易时段
+        if not is_in_trading_hours():
+            logger.warning("盘中刷新功能仅在交易时段（9:25-15:00）可用")
+            raise HTTPException(status_code=400, detail="盘中刷新功能仅在交易时段（9:25-15:00）可用")
+
+        from src.data_acquisition import DataAcquisitionService
+
+        logger.info("盘中刷新今日首板数据开始")
+        logger.info(f"用户选择的刷新日期: {targetDate}")
+
+        service = DataAcquisitionService()
+
+        # 清空临时表
+        db.clear_first_limits_tmp_tables()
+
+        # 确定查询日期（总是使用 get_query_trading_date()，不论用户选择什么日期）
+        # 因为盘中刷新的是当日实时数据，而不是历史数据
+        query_date = get_query_trading_date()
+
+        # 获取数据（使用临时表）
+        raw_result = service.fetch_and_save_limit_data(query_date, use_tmp_table=True)
+
+        logger.info(f"盘中刷新完成: {raw_result}")
+
+        # ===== 总是自动创建题材卡片（盘中数据会变化） =====
+        activated_topics = db.auto_create_topic_cards_for_date(
+            query_date,
+            topics_table="first_limit_topics_tmp",
+            activations_table="topic_activations_tmp",
+            first_limits_table="first_limits_tmp"
+        )
+
+        logger.info(f"盘中刷新 激活题材: {len(activated_topics)} 个")
+
+        result = {
+            "success": raw_result.get("success", False) or (raw_result.get("first_limit_count", 0) > 0),
+            "message": raw_result.get("message", ""),
+            "first_limit_count": raw_result.get("first_limit_count", 0),
+            "continuous_limit_count": raw_result.get("continuous_limit_count", 0),
+            "exploded_count": raw_result.get("exploded_count", 0),
+            "limit_down_count": raw_result.get("limit_down_count", 0),
+            "total_records": raw_result.get("total_records", 0),
+            "trade_date": query_date,
+            "is_trading": True,
+            "using_tmp_table": True,  # 使用临时表
+            "auto_created_topics": True,
+            "activated_topics": activated_topics,
+            "activated_topics_count": len(activated_topics)
+        }
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"盘中刷新今日首板数据失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1977,6 +2189,34 @@ async def get_topic_active_stocks(topic_name: str = "", days: int = 24):
         logger.error(f"获取题材活跃标的失败: {e}", exc_info=True)
         return {"success": False, "error": str(e), "topic_name": topic_name}
 
+@app.get("/api/topic-trend-stocks")
+async def get_topic_trend_stocks(topic_name: str = "", days: int = 24):
+    """
+    获取题材的趋势标历史（近N个交易日中的趋势标的入选数据）
+
+    参数：
+    - topic_name: 题材名称
+    - days: 查询的天数（默认24个交易日）
+
+    返回：
+    - success: 是否成功
+    - data: 趋势标数据（按入选次数和日期分组）
+    """
+    try:
+        if not topic_name:
+            return {"success": False, "error": "题材名称不能为空"}
+
+        data = db.get_topic_trend_stocks(topic_name, days)
+
+        return {
+            "success": True,
+            "topic_name": topic_name,
+            "data": data
+        }
+    except Exception as e:
+        logger.error(f"获取题材趋势标失败: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "topic_name": topic_name}
+
 @app.post("/api/remove-topic-from-date")
 async def remove_topic_from_date(topic_data: Dict = Body(...)):
     """删除某天某题材的记录"""
@@ -2094,8 +2334,17 @@ async def get_dashboard_data(queryDate: str = None):
         # 其他板块不使用日期选择器
         sectors = await service.get_sector_analysis()
 
+        # 今日首板板块：判断是否应该使用临时表
+        # 规则：
+        # 1. 查询的日期 == get_query_trading_date()（今天应显示的交易日） 且 在交易时段：使用临时表
+        # 2. 其他情况：使用正式表
+        should_use_tmp_table_for_today = (today == get_query_trading_date() and is_in_trading_hours())
+        first_limits_table = "first_limits_tmp" if should_use_tmp_table_for_today else "first_limits"
+        activations_table = "topic_activations_tmp" if should_use_tmp_table_for_today else "topic_activations"
+        topics_table = "first_limit_topics_tmp" if should_use_tmp_table_for_today else "first_limit_topics"
+
         # 首板数据：优先从数据库读取（包含 first_limit_id 和 stock_id）
-        db_first_limits = db.get_first_limits_by_date(today)
+        db_first_limits = db.get_first_limits_by_date(today, table=first_limits_table)
 
         first_limits = []
         if db_first_limits:
@@ -2119,16 +2368,17 @@ async def get_dashboard_data(queryDate: str = None):
         # 3. 题材卡片中的标的信息：根据 topic_id + association_date 从 first_limit_topics 表查询
         # 4. 关键点：只查询 topic_activations 表，不查询 topic_stock_relations（topic_stock_relations 是持久关联，由其他页面管理）
         # 5. today 是 get_query_trading_date() 返回的日期（开盘后应查看的交易日），用于查询今日首板相关数据
+        # 6. 盘中数据：使用临时表；盘外数据：使用正式表
 
         today_topics = []
         try:
             # 核心步骤1：从 topic_activations 表获取 today 日期激活的题材（决定显示哪些题材卡片）
-            activated_topics = db.get_activated_topics(today)
+            activated_topics = db.get_activated_topics(today, table=activations_table)
 
             # 核心步骤2：对每个激活的题材，查询 today 日期关联的首板标的（从 first_limit_topics 表）
             for topic in activated_topics:
                 # 获取该题材在 today 关联的首板标的（使用 association_date 过滤）
-                stocks = db.get_topic_first_limits_by_association_date(topic['topic_id'], today)
+                stocks = db.get_topic_first_limits_by_association_date(topic['topic_id'], today, table=topics_table)
 
                 if stocks:
                     stocks_data = []
@@ -2171,6 +2421,8 @@ async def get_dashboard_data(queryDate: str = None):
             "market_summary": market_summary,
             "display_date": display_date,
             "query_date": today,  # 今日首板板块使用的查询日期
+            "is_trading": is_in_trading_hours(),  # 当前是否在交易时段
+            "using_tmp_table": should_use_tmp_table_for_today,  # 是否使用临时表（基于查询日期判断）
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
@@ -2183,13 +2435,13 @@ async def get_dashboard_data(queryDate: str = None):
 
 @app.get("/")
 async def dashboard(request: Request):
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    return templates.TemplateResponse(request, "dashboard.html")
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
-        "service": "A股复盘系统",
+        "service": "A股复盘工具",
         "version": "2.0.0",
         "data_source": "AkShare",
         "timestamp": datetime.now().isoformat()
@@ -2590,7 +2842,7 @@ async def remove_first_limit_topic(data: Dict = Body(...)):
         if success:
             return {"success": True, "message": "移除成功"}
         else:
-            return {"success": False, "message": "移除失败"}
+            return {"success": False, "message": "移除失败：未找到指定日期的关联记录"}
     except Exception as e:
         logger.error(f"移除首板-题材关联失败: {e}", exc_info=True)
         return {"success": False, "message": str(e)}
@@ -3078,10 +3330,10 @@ async def get_sector_high_stocks(date: str = None, onlyHistoryHigh: bool = False
         industry_filter = f"AND s.industry = ?" if industry else ""
 
         cursor.execute(f'''
-            SELECT 
+            SELECT DISTINCT
                 s.stock_code,
                 s.stock_name,
-                ps.change_percent
+                MAX(ps.change_percent) as change_percent
             FROM popularity_stocks ps
             JOIN stocks s ON ps.stock_id = s.stock_id
             JOIN popularity_sources psrc ON ps.source_id = psrc.source_id
@@ -3089,7 +3341,8 @@ async def get_sector_high_stocks(date: str = None, onlyHistoryHigh: bool = False
             AND psrc.source_name IN {source_filter}
             AND (s.industry IS NOT NULL AND s.industry != '')
             {industry_filter}
-            ORDER BY ps.change_percent DESC
+            GROUP BY s.stock_code, s.stock_name
+            ORDER BY change_percent DESC
         ''', (query_date, *([industry] if industry else [])))
 
         stocks = []
@@ -3169,6 +3422,300 @@ async def get_hot_stocks_data(queryDate: str = None):
     except Exception as e:
         logger.error(f"获取标的热度数据失败: {e}", exc_info=True)
         return {"success": False, "message": str(e), "trade_date": None, "popularity_sources": [], "popularity_data": [], "amount_types": [], "amount_data": []}
+
+
+@app.get("/api/strong-stocks")
+async def get_strong_stocks_data(queryDate: str = None, hotType: str = None):
+    """
+    获取强势股池数据
+
+    Args:
+        queryDate: 查询日期（格式：YYYY-MM-DD），可选
+        hotType: 热度类型（如'60日新高'），可选，不传则返回所有类型
+    """
+    try:
+        now = datetime.now()
+        current_date = now.date().strftime("%Y-%m-%d")
+        current_time = now.time()
+        market_open_time = time(9, 15)
+
+        # 获取最新交易日
+        latest_trading_date = get_latest_trading_date_from_db()
+        if not latest_trading_date:
+            latest_trading_date = get_last_trading_day()
+
+        trade_date = None
+
+        if queryDate:
+            trade_date = queryDate
+        else:
+            # 自动选择日期
+            if current_time < market_open_time:
+                conn = db._get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT MAX(date)
+                    FROM trading_days
+                    WHERE date < ? AND is_active = 1
+                ''', (current_date,))
+                result = cursor.fetchone()
+                conn.close()
+
+                if result and result[0]:
+                    trade_date = result[0]
+                else:
+                    trade_date = latest_trading_date
+            else:
+                from src.db_operations import is_trading_day
+                if is_trading_day(current_date):
+                    trade_date = current_date
+                else:
+                    trade_date = latest_trading_date
+
+        # 获取强势股热度类型
+        hot_types = db.get_strong_stock_types()
+
+        # 获取强势股数据
+        strong_stocks = db.get_strong_stocks(hot_type=hotType, trade_date=trade_date)
+
+        return {
+            "success": True,
+            "trade_date": trade_date,
+            "hot_types": hot_types,
+            "strong_stocks": strong_stocks
+        }
+
+    except Exception as e:
+        logger.error(f"获取强势股数据失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "trade_date": None, "hot_types": [], "strong_stocks": []}
+
+
+@app.get("/api/has-strong-stocks")
+async def has_strong_stocks(queryDate: str = None):
+    """
+    检查数据库中是否存在强势标的（首板）数据
+
+    Args:
+        queryDate: 查询日期（格式：YYYY-MM-DD），可选
+
+    Returns:
+        has_data: 是否存在强势标的数据
+    """
+    try:
+        # 获取查询日期
+        if not queryDate:
+            latest_trading_date = get_latest_trading_date_from_db()
+            if not latest_trading_date:
+                latest_trading_date = get_last_trading_day()
+            queryDate = latest_trading_date
+
+        # 检查强势标的表是否有数据
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*)
+            FROM strong_stocks
+            WHERE trade_date = ?
+        ''', (queryDate,))
+        count = cursor.fetchone()[0]
+        conn.close()
+
+        return {
+            "success": True,
+            "has_data": count > 0,
+            "count": count,
+            "query_date": queryDate
+        }
+
+    except Exception as e:
+        logger.error(f"检查强势标的存在失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e),
+            "has_data": False,
+            "query_date": queryDate
+        }
+
+
+@app.get("/api/check-primary-filtered")
+async def check_primary_filtered(queryDate: str = None):
+    """
+    检查根据初选规则筛选后，是否有符合条件的标的
+
+    Args:
+        queryDate: 查询日期（格式：YYYY-MM-DD），可选
+
+    Returns:
+        has_results: 是否有符合初选规则的标的
+    """
+    try:
+        # 获取查询日期
+        if not queryDate:
+            latest_trading_date = get_latest_trading_date_from_db()
+            if not latest_trading_date:
+                latest_trading_date = get_last_trading_day()
+            queryDate = latest_trading_date
+
+        # 从配置文件读取初选规则
+        config_file = 'config/trend_filter_rules.json'
+        config = {}
+
+        if os.path.exists(config_file):
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        else:
+            # 使用默认配置
+            config = {
+                'price': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 10.0, 'max': None},
+                'change_percent': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 5.0, 'max': None},
+                'amount': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 300.0, 'max': None},
+                'turnover': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 2.0, 'max': None},
+                'volume_ratio': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 1.0, 'max': None},
+                'continuous_limit': {'enabled': True, 'mode': 'require', 'min_days': 2},
+                'max_count': 20
+            }
+
+        # 提取配置
+        def get_field_value(field_config, key, default):
+            if field_config is None:
+                return default
+            return field_config.get(key, default)
+
+        price_config = config.get('price', {})
+        change_percent_config = config.get('change_percent', {})
+        amount_config = config.get('amount', {})
+        turnover_config = config.get('turnover', {})
+        volume_ratio_config = config.get('volume_ratio', {})
+        continuous_limit_config = config.get('continuous_limit', {})
+
+        # 价格筛选
+        price_enabled = get_field_value(price_config, 'enabled', True)
+        price_min_enabled = get_field_value(price_config, 'min_enabled', True)
+        price_max_enabled = get_field_value(price_config, 'max_enabled', False)
+        price_min = get_field_value(price_config, 'min', 10.0)
+        price_max = get_field_value(price_config, 'max', None)
+
+        # 涨幅筛选
+        change_percent_enabled = get_field_value(change_percent_config, 'enabled', True)
+        change_percent_min_enabled = get_field_value(change_percent_config, 'min_enabled', True)
+        change_percent_max_enabled = get_field_value(change_percent_config, 'max_enabled', False)
+        change_percent_min = get_field_value(change_percent_config, 'min', 5.0)
+        change_percent_max = get_field_value(change_percent_config, 'max', None)
+
+        # 成交额筛选
+        amount_enabled = get_field_value(amount_config, 'enabled', True)
+        amount_min_enabled = get_field_value(amount_config, 'min_enabled', True)
+        amount_max_enabled = get_field_value(amount_config, 'max_enabled', False)
+        amount_min_wan = get_field_value(amount_config, 'min', 300.0)
+        amount_max_wan = get_field_value(amount_config, 'max', None)
+
+        # 换手率筛选
+        turnover_enabled = get_field_value(turnover_config, 'enabled', True)
+        turnover_min_enabled = get_field_value(turnover_config, 'min_enabled', True)
+        turnover_max_enabled = get_field_value(turnover_config, 'max_enabled', False)
+        turnover_min = get_field_value(turnover_config, 'min', 2.0)
+        turnover_max = get_field_value(turnover_config, 'max', None)
+
+        # 量比筛选
+        volume_ratio_enabled = get_field_value(volume_ratio_config, 'enabled', True)
+        volume_ratio_min_enabled = get_field_value(volume_ratio_config, 'min_enabled', True)
+        volume_ratio_max_enabled = get_field_value(volume_ratio_config, 'max_enabled', False)
+        volume_ratio_min = get_field_value(volume_ratio_config, 'min', 1.0)
+        volume_ratio_max = get_field_value(volume_ratio_config, 'max', None)
+
+        # 连板筛选
+        continuous_limit_enabled = get_field_value(continuous_limit_config, 'enabled', True)
+        continuous_limit_mode = get_field_value(continuous_limit_config, 'mode', 'require')
+        continuous_limit_min_days = get_field_value(continuous_limit_config, 'min_days', 2)
+
+        # 构建SQL查询
+        conditions = ['ss.trade_date = ?']
+        params = [queryDate]
+
+        # 价格筛选
+        if price_enabled:
+            if price_min_enabled and price_min is not None and price_min > 0:
+                conditions.append('ss.price >= ?')
+                params.append(price_min)
+            if price_max_enabled and price_max is not None and price_max > 0:
+                conditions.append('ss.price <= ?')
+                params.append(price_max)
+
+        # 涨幅筛选
+        if change_percent_enabled:
+            if change_percent_min_enabled and change_percent_min is not None and change_percent_min > 0:
+                conditions.append('ss.change_percent >= ?')
+                params.append(change_percent_min)
+            if change_percent_max_enabled and change_percent_max is not None and change_percent_max > 0:
+                conditions.append('ss.change_percent <= ?')
+                params.append(change_percent_max)
+
+        # 成交额筛选（转换为元）
+        if amount_enabled:
+            if amount_min_enabled and amount_min_wan is not None and amount_min_wan > 0:
+                conditions.append('ss.amount >= ?')
+                params.append(amount_min_wan * 10000)
+            if amount_max_enabled and amount_max_wan is not None and amount_max_wan > 0:
+                conditions.append('ss.amount <= ?')
+                params.append(amount_max_wan * 10000)
+
+        # 换手率筛选
+        if turnover_enabled:
+            if turnover_min_enabled and turnover_min is not None and turnover_min > 0:
+                conditions.append('ss.turnover_rate >= ?')
+                params.append(turnover_min)
+            if turnover_max_enabled and turnover_max is not None and turnover_max > 0:
+                conditions.append('ss.turnover_rate <= ?')
+                params.append(turnover_max)
+
+        # 量比筛选
+        if volume_ratio_enabled:
+            if volume_ratio_min_enabled and volume_ratio_min is not None and volume_ratio_min > 0:
+                conditions.append('ss.volume_ratio >= ?')
+                params.append(volume_ratio_min)
+            if volume_ratio_max_enabled and volume_ratio_max is not None and volume_ratio_max > 0:
+                conditions.append('ss.volume_ratio <= ?')
+                params.append(volume_ratio_max)
+
+        # 连板筛选
+        if continuous_limit_enabled:
+            if continuous_limit_mode == 'require':
+                conditions.append('ss.continuous_limit_days >= ?')
+                params.append(continuous_limit_min_days)
+            elif continuous_limit_mode == 'exclude':
+                conditions.append('ss.continuous_limit_days < ?')
+                params.append(continuous_limit_min_days)
+
+        where_clause = ' AND '.join(conditions)
+
+        sql = f'''
+            SELECT COUNT(*)
+            FROM strong_stocks ss
+            JOIN stocks s ON ss.stock_id = s.stock_id
+            WHERE {where_clause}
+        '''
+
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql, tuple(params))
+        count = cursor.fetchone()[0]
+        conn.close()
+
+        return {
+            "success": True,
+            "has_results": count > 0,
+            "count": count,
+            "query_date": queryDate
+        }
+
+    except Exception as e:
+        logger.error(f"检查初选结果失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e),
+            "has_results": False,
+            "query_date": queryDate
+        }
 
 
 @app.post("/api/hot-stocks/refresh")
@@ -3278,12 +3825,27 @@ async def refresh_hot_stocks_data(targetDate: str = Body(..., embed=True, descri
                     "count": popularity_result.get("record_count", 0)
                 }
 
-        success_count = sum(1 for v in results["popularity_data"].values() if v["success"]) if results.get("popularity_data") else 0
-        if results["full_day_amount"]["success"]:
-            success_count += 1
+        # 强势股池数据刷新逻辑
+        logger.info("开始刷新强势股池数据...")
+        strong_result = await service.fetch_and_save_strong_stocks(targetDate)
+        results["strong_stocks"] = {
+            "success": strong_result.get("success", False),
+            "message": strong_result.get("message", ""),
+            "count": strong_result.get("total_count", 0),
+            "hot_types": strong_result.get("hot_types", [])
+        }
 
         message_parts = []
         message_parts.append(f"目标日期: {targetDate}")
+
+        if strong_result.get("success"):
+            message_parts.append(f"强势股池: {strong_result.get('total_count', 0)}条")
+        else:
+            message_parts.append(f"强势股池: {strong_result.get('message', '未知错误')}")
+
+        success_count = sum(1 for v in results["popularity_data"].values() if v["success"]) if results.get("popularity_data") else 0
+        if results["full_day_amount"]["success"]:
+            success_count += 1
 
         if results["auction_amount"]["success"]:
             message_parts.append(f"竞价成交额: {results['auction_amount']['count']}条")
@@ -3322,6 +3884,101 @@ class SettingsConfig(BaseModel):
     mairui_base_url: Optional[str] = None
 
 
+class RangeFilterConfig(BaseModel):
+    enabled: bool = True
+    min_enabled: bool = True
+    max_enabled: bool = False
+    min: Optional[float] = None
+    max: Optional[float] = None
+
+
+class ContinuousLimitConfig(BaseModel):
+    enabled: bool = True
+    mode: str = 'require'
+    min_days: int = 2
+
+
+class TrendFilterRules(BaseModel):
+    price: RangeFilterConfig = RangeFilterConfig()
+    change_percent: RangeFilterConfig = RangeFilterConfig()
+    amount: RangeFilterConfig = RangeFilterConfig()
+    turnover: RangeFilterConfig = RangeFilterConfig()
+    volume_ratio: RangeFilterConfig = RangeFilterConfig()
+    continuous_limit: ContinuousLimitConfig = ContinuousLimitConfig()
+    max_count: int = 20
+
+
+@app.get("/api/trend-filter-rules")
+async def get_trend_filter_rules():
+    """获取趋势标的初选规则配置"""
+    try:
+        config_file = 'config/trend_filter_rules.json'
+        if not os.path.exists(config_file):
+            raise HTTPException(status_code=404, detail="配置文件不存在")
+
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+
+        return {
+            "success": True,
+            "config": config
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取初选规则配置失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取配置失败: {str(e)}")
+
+
+@app.post("/api/trend-filter-rules")
+async def save_trend_filter_rules(rules: TrendFilterRules):
+    """保存趋势标的初选规则配置"""
+    try:
+        config_file = 'config/trend_filter_rules.json'
+        config_dir = os.path.dirname(config_file)
+
+        if config_dir and not os.path.exists(config_dir):
+            os.makedirs(config_dir, exist_ok=True)
+
+        config_dict = rules.model_dump()
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(config_dict, f, ensure_ascii=False, indent=4)
+
+        logger.info(f"初选规则配置已保存: {config_dict}")
+        return {
+            "success": True,
+            "message": "配置已保存"
+        }
+    except Exception as e:
+        logger.error(f"保存初选规则配置失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"保存配置失败: {str(e)}")
+
+
+@app.post("/api/trend-filter-rules/reset")
+async def reset_trend_filter_rules():
+    """重置趋势标的初选规则为默认值"""
+    try:
+        default_config_file = 'config/trend_filter_rules.default.json'
+
+        if not os.path.exists(default_config_file):
+            raise HTTPException(status_code=404, detail="默认配置文件不存在")
+
+        with open(default_config_file, 'r', encoding='utf-8') as f:
+            default_config = json.load(f)
+
+        logger.info(f"已加载默认趋势标筛选配置: {default_config}")
+
+        return {
+            "success": True,
+            "config": default_config
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"重置初选规则失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"重置配置失败: {str(e)}")
+
+
 @app.get("/api/settings")
 async def get_settings():
     """获取环境配置"""
@@ -3339,7 +3996,7 @@ async def get_settings():
 async def save_settings(config: SettingsConfig):
     """保存环境配置到.env文件"""
     try:
-        env_file = '.env'
+        env_file = '.env.1'
         env_lines = []
 
         # 读取现有的.env文件内容（如果存在）
@@ -3381,6 +4038,959 @@ async def save_settings(config: SettingsConfig):
     except Exception as e:
         logger.error(f"保存配置失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"保存配置失败: {str(e)}")
+
+
+def _check_has_kline_data(trade_date: str) -> bool:
+    """
+    检查某个日期是否有K线数据（用于判断API是否成功但评分过低）
+
+    Args:
+        trade_date: 交易日期（格式YYYY-MM-DD）
+
+    Returns:
+        bool: 是否有K线数据
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM stock_daily_data WHERE trade_date >= ?', (trade_date,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count > 0
+    except Exception as e:
+        logger.error(f"检查K线数据失败: {e}")
+        return False
+
+
+# ========== 趋势标的相关API（独立模块，不改造原有功能）==========
+
+@app.get("/api/trend-stocks")
+async def get_trend_stocks_data(
+    queryDate: str = None,
+    force_refresh: str = None
+):
+    """
+    获取趋势标的列表
+
+    优先从数据库读取，无数据时才实时计算
+    支持 force_refresh 参数强制刷新（异步版本）
+    配置从配置文件读取
+
+    Args:
+        queryDate: 查询日期（格式：YYYY-MM-DD），可选
+        force_refresh: 是否强制刷新（跳过数据库直接计算），"true"|"false"
+    """
+    try:
+        logger.info(f"[API] 收到趋势标的请求: queryDate={queryDate}, force_refresh={force_refresh}")
+
+        # 获取查询日期
+        if not queryDate:
+            latest_trading_date = get_latest_trading_date_from_db()
+            if not latest_trading_date:
+                latest_trading_date = get_last_trading_day()
+            queryDate = latest_trading_date
+        elif queryDate in ['今日', 'today']:
+            # 处理"今日"参数
+            latest_trading_date = get_latest_trading_date_from_db()
+            if not latest_trading_date:
+                latest_trading_date = get_last_trading_day()
+            queryDate = latest_trading_date
+            logger.info(f"queryDate为'{queryDate}'，已转换为最新交易日: {queryDate}")
+
+        # 从配置文件读取筛选规则
+        config_file = 'config/trend_filter_rules.json'
+        config = {}
+
+        if os.path.exists(config_file):
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            logger.info(f"从配置文件读取初选规则: {config_file}")
+        else:
+            # 使用默认配置
+            config = {
+                'price': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 10.0, 'max': None},
+                'change_percent': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 5.0, 'max': None},
+                'amount': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 300.0, 'max': None},
+                'turnover': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 2.0, 'max': None},
+                'volume_ratio': {'enabled': True, 'min_enabled': True, 'max_enabled': False, 'min': 1.0, 'max': None},
+                'continuous_limit': {'enabled': True, 'mode': 'require', 'min_days': 2},
+                'max_count': 20
+            }
+            logger.warning(f"配置文件不存在，使用默认配置")
+
+        # 调用独立的趋势票分析模块
+        from src.trend_analysis import TrendStockAnalyzer
+
+        analyzer = TrendStockAnalyzer()
+
+        # 判断是否强制刷新
+        is_force_refresh = force_refresh and force_refresh.lower() in ['true', '1', 'yes']
+
+        has_api_success = False
+
+        logger.info(f"[API] 开始处理趋势标请求: queryDate={queryDate}, is_force_refresh={is_force_refresh}")
+
+        if is_force_refresh:
+            logger.info(f"[API] 强制刷新趋势票数据 ({queryDate})，跳过数据库")
+            trend_stocks = await analyzer.get_trend_stocks_by_date(queryDate, config=config)
+            source = "实时计算"
+        else:
+            # 优先从数据库读取
+            trend_stocks = analyzer.get_saved_trend_stocks(queryDate)
+
+            if not trend_stocks or len(trend_stocks) == 0:
+                # 检查是否有K线数据（说明API成功但评分过低）
+                has_kline_data = _check_has_kline_data(queryDate)
+                if has_kline_data:
+                    has_api_success = True
+                    logger.info(f"[API] 日期 {queryDate} 有K线数据但无趋势标（API成功但评分均<50分）")
+
+                logger.info(f"[API] 数据库中无趋势票数据 ({queryDate})，开始实时计算...")
+                # 实时计算（异步执行，不阻塞其他请求）
+                trend_stocks = await analyzer.get_trend_stocks_by_date(queryDate, config=config)
+                source = "实时计算"
+            else:
+                logger.info(f"[API] 从数据库读取到 {len(trend_stocks)} 只趋势票")
+                source = "数据库"
+
+        logger.info(f"[API] 趋势标请求完成: queryDate={queryDate}, source={source}, 数量={len(trend_stocks)}")
+
+        return {
+            "success": True,
+            "queryDate": queryDate,
+            "trend_stocks": trend_stocks,
+            "source": source,
+            "has_api_success": has_api_success or len(trend_stocks) > 0
+        }
+    except Exception as e:
+        logger.error(f"[API] 获取趋势标的失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e),
+            "queryDate": queryDate,
+            "trend_stocks": []
+        }
+
+
+@app.get("/api/trend-stocks/history")
+async def get_trend_stocks_history(days: int = 24):
+    """
+    获取近N个交易日的趋势标历史数据
+
+    统计每个标的所有入选记录，按入选次数和最近入选日期分类
+
+    Args:
+        days: 查询天数（默认24），包含查询日期
+    """
+    try:
+        from datetime import datetime
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        logger.info(f"开始获取历史趋势标数据（最近{days}个交易日）")
+
+        # 历史趋势标查询使用正式表
+        first_limits_table = "first_limits"
+
+        # 获取最近N个交易日
+        cursor.execute('''
+            SELECT DISTINCT trade_date
+            FROM trend_stocks
+            ORDER BY trade_date DESC
+            LIMIT ?
+        ''', (days,))
+
+        trading_dates = [row[0] for row in cursor.fetchall()]
+
+        if not trading_dates:
+            conn.close()
+            return {
+                "success": False,
+                "message": "暂无趋势标数据",
+                "data": {
+                    "by_count": {},
+                    "by_date": {}
+                }
+            }
+
+        date_placeholders = ','.join(['?' for _ in trading_dates])
+
+        # 查询所有趋势标数据
+        query = f'''
+            SELECT
+                s.stock_code,
+                s.stock_name,
+                ts.trade_date,
+                ts.total_score,
+                ts.change_pct_60d
+            FROM trend_stocks ts
+            JOIN stocks s ON ts.stock_id = s.stock_id
+            WHERE ts.trade_date IN ({date_placeholders})
+            ORDER BY ts.trade_date DESC
+        '''
+
+        cursor.execute(query, trading_dates)
+        trend_rows = cursor.fetchall()
+
+        logger.info(f"历史趋势标: 获取到 {len(trend_rows)} 条记录")
+
+        # 查询所有涨停数据
+        query_limits = f'''
+            SELECT
+                s.stock_code,
+                COUNT(*) as limit_count
+            FROM {first_limits_table} fl
+            JOIN stocks s ON fl.stock_id = s.stock_id
+            WHERE fl.limit_date IN ({date_placeholders})
+            GROUP BY s.stock_id
+        '''
+
+        cursor.execute(query_limits, trading_dates)
+        limit_rows = cursor.fetchall()
+
+        # 构建涨停次数字典
+        limit_count_map = {}
+        for code, count in limit_rows:
+            limit_count_map[code] = count
+
+        logger.info(f"历史趋势标: 涨停数据 {len(limit_count_map)} 只股票")
+
+        # 查询所有新高数据
+        query_highs = f'''
+            SELECT
+                s.stock_code,
+                COUNT(*) as new_high_count
+            FROM popularity_stocks ps
+            JOIN stocks s ON ps.stock_id = s.stock_id
+            WHERE ps.trade_date IN ({date_placeholders})
+              AND ps.source_id = 9
+            GROUP BY s.stock_id
+        '''
+
+        cursor.execute(query_highs, trading_dates)
+        high_rows = cursor.fetchall()
+
+        # 构建新高次数字典
+        new_high_count_map = {}
+        for code, count in high_rows:
+            new_high_count_map[code] = count
+
+        logger.info(f"历史趋势标: 新高数据 {len(new_high_count_map)} 只股票")
+
+        conn.close()
+
+        # 第一步：按股票整理入选记录（包含完整统计数据）
+        stock_selections = {}
+
+        for row in trend_rows:
+            code, name, date, score, change_pct_60d = row
+
+            # 只处理有效记录（score > 0）
+            if score <= 0:
+                continue
+
+            # 处理 change_pct_60d（可能是二进制数据）
+            try:
+                if isinstance(change_pct_60d, bytes):
+                    change_pct_60d = struct.unpack('d', change_pct_60d)[0]
+            except:
+                change_pct_60d = None
+
+            if code not in stock_selections:
+                stock_selections[code] = {
+                    "code": code,
+                    "name": name,
+                    "selection_dates": [],
+                    "scores": [],
+                    "changes_60d": [],
+                    "limit_count": limit_count_map.get(code, 0),
+                    "new_high_count": new_high_count_map.get(code, 0)
+                }
+
+            stock_selections[code]["selection_dates"].append(date)
+            stock_selections[code]["scores"].append(score)
+            stock_selections[code]["changes_60d"].append(change_pct_60d)
+
+        # 第二步：按入选次数分类
+        by_count = {}
+
+        for code, data in stock_selections.items():
+            count = len(data["selection_dates"])
+
+            # 计算统计数据
+            selection_count = count
+            recent_date = max(data["selection_dates"]) if data["selection_dates"] else None
+            recent_score = None
+            latest_60d_change = None
+
+            # 找到最新日期的得分和涨幅
+            for i, date in enumerate(data["selection_dates"]):
+                if date == recent_date:
+                    recent_score = data["scores"][i]
+                    latest_60d_change = data["changes_60d"][i]
+                    break
+
+            if count not in by_count:
+                by_count[count] = []
+
+            by_count[count].append({
+                "code": data["code"],
+                "name": data["name"],
+                "selection_count": selection_count,
+                "selection_dates": data["selection_dates"],
+                "scores": data["scores"],
+                "changes_60d": data["changes_60d"],
+                "recent_score": recent_score,
+                "latest_60d_change": latest_60d_change,
+                "limit_count": data["limit_count"],
+                "new_high_count": data["new_high_count"]
+            })
+
+        # 第三步：按日期分类（每只股票只在最近入选日期显示）
+        by_date = {}
+        for code, data in stock_selections.items():
+            # 找到最近入选日期
+            recent_date = max(data["selection_dates"]) if data["selection_dates"] else None
+
+            if recent_date:
+                if recent_date not in by_date:
+                    by_date[recent_date] = []
+
+                # 找到对应日期的索引
+                recent_index = data["selection_dates"].index(recent_date)
+
+                by_date[recent_date].append({
+                    "code": data["code"],
+                    "name": data["name"],
+                    "recent_score": data["scores"][recent_index],
+                    "latest_60d_change": data["changes_60d"][recent_index],
+                    "limit_count": data["limit_count"],
+                    "new_high_count": data["new_high_count"]
+                })
+
+        # 按次数从高到低排序
+        by_count_sorted = {}
+        for count in sorted(by_count.keys(), reverse=True):
+            by_count_sorted[count] = by_count[count]
+
+        logger.info(f"历史趋势标: 完成，共{len(by_count_sorted)}个入选次数分组，{len(by_date)}个日期，{len(stock_selections)}只股票")
+
+        return {
+            "success": True,
+            "data": {
+                "by_count": by_count_sorted,
+                "by_date": by_date
+            }
+        }
+    except Exception as e:
+        logger.error(f"获取趋势标历史数据失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e),
+            "data": {
+                "by_count": {},
+                "by_date": {}
+            }
+        }
+
+
+@app.post("/api/trend-stocks/calculate")
+async def calculate_trend_stocks_data(targetDate: str = Body(..., embed=True, description="要计算的目标日期")):
+    """
+    计算并保存趋势票数据（收盘后执行）
+
+    Args:
+        targetDate: 要计算的目标日期（格式：YYYY-MM-DD）
+    """
+    try:
+        from src.trend_analysis import TrendStockAnalyzer
+        
+        analyzer = TrendStockAnalyzer()
+        count, message = analyzer.calculate_and_save_trend_stocks(targetDate)
+        
+        return {
+            "success": True,
+            "message": message,
+            "targetDate": targetDate,
+            "count": count
+        }
+    except Exception as e:
+        logger.error(f"计算趋势票失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e),
+            "targetDate": targetDate,
+            "count": 0
+        }
+
+
+@app.get("/api/stock-kline")
+async def get_stock_kline(code: str, days: int = 90):
+    """
+    获取股票K线数据（带均线）
+    
+    Args:
+        code: 股票代码
+        days: 获取天数（默认90天）
+    """
+    try:
+        import numpy as np
+        from src.trend_analysis import TrendStockAnalyzer
+        
+        analyzer = TrendStockAnalyzer()
+        
+        # 获取K线数据
+        df = analyzer.fetch_stock_kline(code, days=days)
+        
+        if df is None or len(df) == 0:
+            return {
+                "success": False,
+                "message": "无数据",
+                "klines": []
+            }
+        
+        # 计算指标
+        df = analyzer._calculate_indicators(df)
+        
+        # 转换为JSON（处理NaN值）
+        klines = []
+        for _, row in df.iterrows():
+            klines.append({
+                "date": row['date'],
+                "open": float(row['open']),
+                "high": float(row['high']),
+                "low": float(row['low']),
+                "close": float(row['close']),
+                "volume": float(row['volume']),
+                "changePercent": float(row['change_pct']),
+                "ma5": float(row['ma5']) if not np.isnan(row['ma5']) else None,
+                "ma10": float(row['ma10']) if not np.isnan(row['ma10']) else None,
+                "ma20": float(row['ma20']) if not np.isnan(row['ma20']) else None,
+                "ma60": float(row['ma60']) if not np.isnan(row['ma60']) else None
+            })
+        
+        return {
+            "success": True,
+            "klines": klines
+        }
+    except Exception as e:
+        logger.error(f"获取K线失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e),
+            "klines": []
+        }
+
+
+@app.post("/api/trend-scan/run")
+async def run_trend_scan(config: dict = Body(...)):
+    """
+    运行全市场趋势票批量筛选
+    
+    Args:
+        config: 配置字典
+            - run_count: 运行数量（"all" 或具体数量）
+            - exclude_kcb: 排除科创板
+            - exclude_cyb: 排除创业板
+            - exclude_st: 排除ST
+    """
+    try:
+        import subprocess
+        import os
+        import sys
+        import json
+        import psutil
+        from datetime import datetime
+        
+        # 检查是否有任务正在运行
+        progress_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'trend_screen_progress.json')
+        
+        if os.path.exists(progress_file):
+            try:
+                with open(progress_file, 'r', encoding='utf-8') as f:
+                    progress = json.load(f)
+                
+                pid = progress.get('pid')
+                status = progress.get('status')
+                
+                # 如果状态不是completed或error，检查进程是否还在运行
+                if status in ('running', 'starting') and pid:
+                    try:
+                        proc = psutil.Process(pid)
+                        if proc.is_running():
+                            cmd = proc.cmdline()
+                            if any('batch_screen_trend_stocks.py' in item for item in cmd):
+                                logger.warning(f"已有任务正在运行(PID: {pid})，拒绝启动新任务")
+                                return {
+                                    "success": False,
+                                    "message": f"已有任务正在运行中（PID: {pid}），请等待当前任务完成后再启动新任务。\n\n当前进度: {progress.get('processed_count', 0)}/{progress.get('total_count', 0)}"
+                                }
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        pass
+            except Exception as e:
+                logger.warning(f"检查运行状态失败: {e}，继续启动任务")
+        
+        run_count = config.get('run_count', 'all')
+        exclude_kcb = config.get('exclude_kcb', True)
+        exclude_cyb = config.get('exclude_cyb', True)
+        exclude_st = config.get('exclude_st', True)
+        
+        # 准备环境变量
+        env = os.environ.copy()
+        env['RUN_COUNT'] = str(run_count)
+        env['EXCLUDE_KCB'] = str(exclude_kcb)
+        env['EXCLUDE_CYB'] = str(exclude_cyb)
+        env['EXCLUDE_ST'] = str(exclude_st)
+        env['TASK_PID'] = ''
+        
+        # 启动批量筛选脚本
+        script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'batch_screen_trend_stocks.py')
+        
+        # 使用subprocess.Popen异步运行
+        process = subprocess.Popen(
+            [sys.executable, script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=os.path.dirname(os.path.dirname(__file__))
+        )
+        
+        logger.info(f"已启动趋势票批量筛选，进程ID: {process.pid}")
+        
+        # 初始化进度文件，记录PID，防止"秒结束"
+        try:
+            init_progress = {
+                'trade_date': 'initializing',
+                'processed_count': 0,
+                'total_count': int(run_count) if run_count != 'all' else 3360,
+                'processed_codes': [],
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'pid': process.pid,
+                'status': 'starting'
+            }
+            os.makedirs(os.path.dirname(progress_file), exist_ok=True)
+            with open(progress_file, 'w', encoding='utf-8') as f:
+                json.dump(init_progress, f, ensure_ascii=False, indent=2)
+            logger.info(f"初始化进度文件成功，PID: {process.pid}")
+        except Exception as e:
+            logger.warning(f"初始化进度文件失败: {e}，不影响任务启动")
+        
+        return {
+            "success": True,
+            "message": f"批量筛选已启动，进程ID: {process.pid}",
+            "pid": process.pid
+        }
+    except Exception as e:
+        logger.error(f"启动趋势票筛选失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@app.get("/api/trend-scan/progress")
+async def get_trend_scan_progress():
+    """
+    查询趋势票筛选进度
+    """
+    try:
+        import os
+        import json
+        import psutil
+        from datetime import datetime
+        
+        progress_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'trend_screen_progress.json')
+        
+        if not os.path.exists(progress_file):
+            return {
+                "success": True,
+                "running": False
+            }
+        
+        with open(progress_file, 'r', encoding='utf-8') as f:
+            progress = json.load(f)
+        
+        # 检查PID对应的进程是否还在运行
+        is_running = False
+        pid = progress.get('pid')
+        
+        if pid:
+            try:
+                # 检查进程是否存在且是Python进程
+                proc = psutil.Process(pid)
+                # 验证进程是否还在运行
+                if proc.is_running():
+                    cmd = proc.cmdline()
+                    # 确保这是batch_screen_trend_stocks.py进程
+                    is_running = any('batch_screen_trend_stocks.py' in item for item in cmd)
+                    logger.debug(f"PID {pid} 进程运行中: {is_running}")
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                is_running = False
+                logger.debug(f"PID {pid} 进程不存在或无法访问")
+        
+        # 检查进度文件状态
+        status = progress.get('status', 'unknown')
+        
+        # 如果状态是error，直接返回错误
+        if status == 'error':
+            return {
+                "success": True,
+                "running": False,
+                "processed": progress.get('processed_count', 0),
+                "total": progress.get('total_count', 0),
+                "trade_date": progress.get('trade_date', ''),
+                "timestamp": progress.get('timestamp', ''),
+                "error": "获取股票列表失败（网络原因），请稍后重试"
+            }
+        
+        # 如果进程不存在，检查是否刚刚完成（最近10秒内）
+        if not is_running:
+            last_update = progress.get('timestamp', '')
+            if last_update:
+                try:
+                    last_update_dt = datetime.strptime(last_update, "%Y-%m-%d %H:%M:%S")
+                    elapsed = (datetime.now() - last_update_dt).total_seconds()
+                    # 如果进程不存在但最近10秒更新过，暂时认为在运行（可能刚结束）
+                    if elapsed < 10 and progress.get('processed_count', 0) < progress.get('total_count', 0):
+                        is_running = True
+                except ValueError:
+                    pass
+        
+        return {
+            "success": True,
+            "running": is_running,
+            "processed": progress.get('processed_count', 0),
+            "total": progress.get('total_count', 0),
+            "trade_date": progress.get('trade_date', ''),
+            "timestamp": progress.get('timestamp', '')
+        }
+    except Exception as e:
+        logger.error(f"查询筛选进度失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@app.get("/api/sector-mapping/status")
+async def get_sector_mapping_status():
+    """检查板块映射初始化状态"""
+    try:
+        import sqlite3
+        import os
+        import json
+        
+        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'fupan.db')
+        progress_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'sector_mapping_progress.json')
+        
+        # 检查进度文件
+        progress = None
+        if os.path.exists(progress_file):
+            try:
+                with open(progress_file, 'r', encoding='utf-8') as f:
+                    progress = json.load(f)
+            except:
+                pass
+        
+        # 检查是否有进程正在运行
+        is_running = False
+        if progress and progress.get('status') in ('running', 'starting'):
+            import time
+            last_updated = progress.get('timestamp', '')
+            if last_updated:
+                try:
+                    from datetime import datetime
+                    last_update_dt = datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S")
+                    elapsed = (datetime.now() - last_update_dt).total_seconds()
+                    # 如果5分钟内有更新，认为在运行
+                    if elapsed < 300:
+                        is_running = True
+                except:
+                    pass
+        
+        if not os.path.exists(db_path):
+            return {
+                "success": True,
+                "has_mapping": False,
+                "stock_count": 0,
+                "running": is_running,
+                "progress": progress,
+                "message": "数据库不存在"
+            }
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM stocks WHERE all_sectors IS NOT NULL")
+        count = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {
+            "success": True,
+            "has_mapping": count > 0,
+            "stock_count": count,
+            "running": is_running,
+            "progress": progress,
+            "message": "板块映射已初始化" if count > 0 else "板块映射未初始化"
+        }
+    except Exception as e:
+        logger.error(f"检查板块映射状态失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@app.post("/api/sector-mapping/init")
+async def init_sector_mapping():
+    """初始化板块映射（启动init_stock_sector_mapping.py脚本）"""
+    try:
+        import subprocess
+        import os
+        import sys
+        import json
+        
+        # 检查是否有任务在运行
+        progress_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'sector_mapping_progress.json')
+        
+        if os.path.exists(progress_file):
+            try:
+                with open(progress_file, 'r', encoding='utf-8') as f:
+                    progress = json.load(f)
+                
+                if progress.get('status') in ('running', 'starting'):
+                    last_timestamp = progress.get('timestamp', '')
+                    if last_timestamp:
+                        from datetime import datetime
+                        last_update = datetime.strptime(last_timestamp, "%Y-%m-%d %H:%M:%S")
+                        elapsed = (datetime.now() - last_update).total_seconds()
+                        if elapsed < 600:  # 10分钟内有更新
+                            return {
+                                "success": False,
+                                "message": "板块映射初始化任务正在运行中"
+                            }
+            except:
+                pass
+        
+        # 清理旧的进度文件
+        if os.path.exists(progress_file):
+            try:
+                os.remove(progress_file)
+            except:
+                pass
+        
+        # 启动初始化脚本
+        script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'init_stock_sector_mapping.py')
+        
+        if not os.path.exists(script_path):
+            return {
+                "success": False,
+                "message": f"初始化脚本不存在: {script_path}"
+            }
+        
+        # 使用subprocess.Popen异步运行
+        # 不捕获stdout/stderr，让子进程直接输出到控制台
+        process = subprocess.Popen(
+            [sys.executable, script_path],
+            cwd=os.path.dirname(os.path.dirname(__file__))
+        )
+        
+        logger.info(f"已启动板块映射初始化，进程ID: {process.pid}")
+        
+        return {
+            "success": True,
+            "message": f"板块映射初始化已启动，进程ID: {process.pid}",
+            "pid": process.pid
+        }
+    except Exception as e:
+        logger.error(f"启动板块映射初始化失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@app.post("/api/sector-scoring/run")
+async def run_sector_scoring():
+    """运行板块评分流程（分析→查询→更新）"""
+    try:
+        import subprocess
+        import os
+        import sys
+        
+        # 按顺序执行三个脚本的shell脚本
+        commands = [
+            f'cd "{os.path.dirname(os.path.dirname(__file__))}"',
+            f'"{sys.executable}" analyze_trend_stocks_by_sector.py',
+            f'"{sys.executable}" fetch_sector_strength.py',
+            f'"{sys.executable}" update_trend_stocks_with_sector_score.py'
+        ]
+        
+        # 创建临时批处理脚本（Windows）
+        batch_script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'run_sector_scoring.bat')
+        log_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs', 'sector_scoring.log')
+        
+        with open(batch_script_path, 'w', encoding='utf-8') as f:
+            f.write('chcp 65001\n')
+            f.write('\n'.join(commands))
+            f.write('\n')
+        
+        # 启动批处理脚本
+        process = subprocess.Popen(
+            batch_script_path,
+            stdout=open(log_file, 'w', encoding='utf-8') if log_file else subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=os.path.dirname(os.path.dirname(__file__))
+        )
+        
+        logger.info(f"已启动板块评分流程，进程ID: {process.pid}")
+        
+        return {
+            "success": True,
+            "message": f"板块评分流程已启动，进程ID: {process.pid}",
+            "pid": process.pid,
+            "log_file": log_file
+        }
+    except Exception as e:
+        logger.error(f"启动板块评分流程失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+    except Exception as e:
+        logger.error(f"获取股票K线失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e),
+            "klines": []
+        }
+
+
+@app.get("/api/mairui-api-usage")
+async def get_mairui_api_usage():
+    """获取Mairui API调用统计"""
+    try:
+        from src.data_acquisition import get_mairui_api_stats
+        return get_mairui_api_stats()
+    except Exception as e:
+        logger.error(f"获取Mairui API调用统计失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== 盘中记录 API ==========
+# 独立模块：src/intraday_notes.py
+# 数据库表：intraday_notes
+# 日期跟随统一日期选择器（与涨跌停统计/连板梯队/市场总结一致）
+
+from src.intraday_notes import (
+    list_notes as _list_notes,
+    create_note as _create_note,
+    update_note as _update_note,
+    delete_note as _delete_note,
+    get_time_rules as _get_time_rules,
+)
+
+
+@app.get("/api/intraday-notes")
+async def get_intraday_notes(date: str):
+    """获取某日的所有盘中记录（按 note_time 排序）"""
+    try:
+        notes = _list_notes(date)
+        return {"success": True, "date": date, "notes": notes, "count": len(notes)}
+    except Exception as e:
+        logger.error(f"获取盘中记录失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class IntradayNoteCreateRequest(BaseModel):
+    trade_date: str
+    content: str
+    note_time: Optional[str] = None
+    prev_time: Optional[str] = None
+    next_time: Optional[str] = None
+
+
+@app.post("/api/intraday-notes")
+async def create_intraday_note(req: IntradayNoteCreateRequest):
+    """创建或合并盘中记录（后端自动判断合并）
+
+    - 不传 prev_time/next_time：末尾追加，无时间顺序约束（适合事后补录）
+    - 传 prev_time/next_time：中间插入，时间必须严格在 [prev_time, next_time] 范围内
+    """
+    try:
+        result = _create_note(
+            req.trade_date,
+            req.content,
+            req.note_time,
+            req.prev_time,
+            req.next_time,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("msg", "创建失败"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"创建盘中记录失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class IntradayNoteUpdateRequest(BaseModel):
+    content: Optional[str] = None
+    note_time: Optional[str] = None
+
+
+@app.put("/api/intraday-notes/{note_id}")
+async def update_intraday_note(note_id: int, req: IntradayNoteUpdateRequest):
+    """修改盘中记录（内容或时间）"""
+    try:
+        result = _update_note(note_id, req.content, req.note_time)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("msg", "修改失败"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"修改盘中记录失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/intraday-notes/{note_id}")
+async def delete_intraday_note(note_id: int):
+    """删除盘中记录"""
+    try:
+        result = _delete_note(note_id)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("msg", "删除失败"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"删除盘中记录失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/intraday-notes/time-rules")
+async def get_intraday_time_rules(date: str,
+                                  prev_time: Optional[str] = None,
+                                  next_time: Optional[str] = None):
+    """获取时间规则（前端判断用）
+
+    - can_use_system: 当前是否可以用系统时间
+    - current_time: 当前系统时间（HH:MM）
+    - range: 手动选时间的可选范围
+    - is_trading_date: 是否交易日
+    - in_trading_hours: 是否在交易时段
+    """
+    try:
+        rules = _get_time_rules(date, prev_time, next_time)
+        return {"success": True, **rules}
+    except Exception as e:
+        logger.error(f"获取盘中时间规则失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
