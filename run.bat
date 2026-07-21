@@ -30,15 +30,25 @@ if not exist "%VENV_PY%" (
 )
 echo    Python: %VENV_PY%
 
-echo [2] Installing dependencies...
+echo [2] Checking dependencies...
 "%VENV_PY%" -m pip install --upgrade pip >nul 2>&1
-"%VENV_PY%" -m pip install -r "%REQ_FILE%" --upgrade
+REM Try to install deps. If offline, skip but allow server to start anyway
+REM (server uses lazy import for network-only libs, so missing packages
+REM  only affect online features, not local dashboard)
+"%VENV_PY%" -m pip install -r "%REQ_FILE%" --upgrade >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Dependency installation failed.
-    pause
-    exit /b 1
+    echo    [WARN] pip install failed (offline or mirror down).
+    echo    Trying fast core-only install without network...
+    "%VENV_PY%" -m pip install fastapi uvicorn jinja2 pydantic python-multipart >nul 2>&1
+    if errorlevel 1 (
+        echo    [WARN] Offline install also failed. Will try to start anyway.
+        echo    Online features may not work; local dashboard / DB still works.
+    ) else (
+        echo    Core deps installed (offline). Online features may be limited.
+    )
+) else (
+    echo    Dependencies installed.
 )
-echo    Dependencies installed.
 
 echo.
 echo [3] Starting server...

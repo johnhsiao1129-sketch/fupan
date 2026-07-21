@@ -1,10 +1,18 @@
 import sqlite3
 import logging
 import sqlite3
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
 from datetime import datetime, timedelta
 from pathlib import Path
-import akshare as ak
+
+if TYPE_CHECKING:
+    import akshare as ak  # type: ignore[import-not-found]
+
+try:
+    import akshare as ak  # type: ignore[assignment]
+except ImportError:
+    ak = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("akshare 未安装, 交易日历抓取功能不可用")
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +97,9 @@ def fetch_trading_days_from_akshare() -> List[str]:
         交易日列表（格式：YYYY-MM-DD）
     """
     try:
+        if ak is None:
+            logger.warning("akshare 未安装, 跳过交易日历抓取")
+            return []
         logger.info("从 AkShare 获取交易日历...")
         df = ak.tool_trade_date_hist_sina()
 

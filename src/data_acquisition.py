@@ -2,23 +2,51 @@
 数据获取层 - 独立于业务逻辑
 负责从API获取数据并写入数据库
 """
-import akshare as ak
-import pandas as pd
 import logging
 import json
 import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, TYPE_CHECKING, Any
 from data.database import DB_PATH
 import sqlite3
 import os
-from dotenv import load_dotenv
-import requests
+
+# 网络/外部库改为可选依赖：缺失时仅记录警告，不阻止 server 启动
+# TYPE_CHECKING 块让 IDE/LSP 知道这些是 Module 类型（运行时为 None | Module）
+if TYPE_CHECKING:
+    import akshare as ak  # type: ignore[import-not-found]
+    import pandas as pd  # type: ignore[import-not-found]
+    import requests  # type: ignore[import-not-found]
+
+try:
+    import akshare as ak  # type: ignore[assignment]
+except ImportError:
+    ak = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("akshare 未安装, 在线行情/涨跌停抓取功能不可用")
+
+try:
+    import pandas as pd  # type: ignore[assignment]
+except ImportError:
+    pd = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("pandas 未安装, 数据处理受限 (仅影响在线抓取)")
+
+try:
+    import requests  # type: ignore[assignment]
+except ImportError:
+    requests = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("requests 未安装, Mairui 抓取功能不可用")
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv('.env.1')
+except ImportError:
+    _load_dotenv = None
+    logging.getLogger(__name__).warning("python-dotenv 未安装, 将从环境变量读取 Mairui 配置")
 
 logger = logging.getLogger(__name__)
 
 # 加载 Mairui API 配置（全局，避免重复加载）
-load_dotenv('.env.1')
+# dotenv 缺失时直接从环境变量读取（适合手动 export / 已配置好的机器）
 MAIRUI_LICENCE = os.getenv('MAIRUI_LICENCE')
 MAIRUI_BASE_URL = os.getenv('MAIRUI_BASE_URL', 'https://api.mairuiapi.com')
 MAIRUI_STRONG_API_URL = os.getenv('MAIRUI_STRONG_API_URL', 'hslt/qsgc')
@@ -57,6 +85,9 @@ def mairui_get_with_retry(url: str, max_retries: int = 3, timeout: int = 30, ret
     仅在状态码 200 时返回 Response 对象；其他情况 (异常/非200) 触发重试。
     重试 max_retries 次后仍失败则返回最后一次 Response 对象 (可能仍非 200)。
     """
+    if requests is None:
+        logger.warning("requests 未安装, Mairui 抓取不可用")
+        return None
     last_response = None
     last_error = None
     for attempt in range(1, max_retries + 1):

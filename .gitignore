@@ -82,3 +82,6 @@ _to_delete/
 .graph.db
 .graph.db-shm
 .graph.db-wal
+graph.db
+graph.db-shm
+graph.db-wal

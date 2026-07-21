@@ -13,10 +13,26 @@ import random
 import sqlite3
 import struct
 from datetime import datetime, timedelta, time
-import akshare as ak
-import pandas as pd
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 网络/外部库改为可选依赖：缺失时仅记录警告，不阻止 server 启动
+# (server 仍可服务本地数据库/页面，只有调用在线数据功能时才报错)
+try:
+    import akshare as ak  # type: ignore[assignment]
+except ImportError:
+    ak = None  # type: ignore[assignment]
+    logger.warning("akshare 未安装, 在线行情/涨跌停抓取功能不可用")
+
+try:
+    import pandas as pd  # type: ignore[assignment]
+except ImportError:
+    pd = None  # type: ignore[assignment]
+    logger.warning("pandas 未安装, 数据处理受限 (仅影响在线抓取)")
+
 from db_operations import (
     RotationAnalysisDB,
     get_last_trading_day,
@@ -28,9 +44,6 @@ from db_operations import (
 )
 from market_mood_calculator import MarketMoodCalculator
 from data.database import DB_PATH
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="A股复盘工具",
@@ -377,14 +390,18 @@ class StockDataService:
         return "低迷"
     
     def _get_realtime_data(self):
+        if ak is None or pd is None:
+            logger.debug("akshare/pandas 未安装, 跳过实时行情抓取")
+            return None
         try:
             df = ak.stock_zh_a_spot_em()
             if df is not None and len(df) > 0:
-                df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce').fillna(0)
-                df['成交额'] = pd.to_numeric(df['成交额'], errors='coerce').fillna(0)
-                df['最新价'] = pd.to_numeric(df['最新价'], errors='coerce').fillna(0)
-                df['今开'] = pd.to_numeric(df['今开'], errors='coerce').fillna(0)
-                df['昨收'] = pd.to_numeric(df['昨收'], errors='coerce').fillna(0)
+                # pandas: pd.to_numeric returns Series for column inputs, fillna returns Series
+                df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce').fillna(0).astype(float)
+                df['成交额'] = pd.to_numeric(df['成交额'], errors='coerce').fillna(0).astype(float)
+                df['最新价'] = pd.to_numeric(df['最新价'], errors='coerce').fillna(0).astype(float)
+                df['今开'] = pd.to_numeric(df['今开'], errors='coerce').fillna(0).astype(float)
+                df['昨收'] = pd.to_numeric(df['昨收'], errors='coerce').fillna(0).astype(float)
                 return df
         except Exception as e:
             logger.warning(f"获取实时数据异常: {e}")
@@ -744,13 +761,17 @@ class StockDataService:
                     break
                 
                 price = row.get('最新价', 0)
-                if pd.isna(price) or price == 0:
+                if price is None or (isinstance(price, float) and price != price) or price == 0:
                     continue
-                
+
                 code = str(row.get('代码', ''))
                 name = str(row.get('名称', ''))
                 change = float(row.get('涨跌幅', 0))
-                amount = float(row.get('成交额', 0)) / 100000000 if pd.notna(row.get('成交额')) else 0
+                trade_amount = row.get('成交额', 0)
+                amount = (float(trade_amount) / 100000000
+                          if (trade_amount is not None
+                              and not (isinstance(trade_amount, float) and trade_amount != trade_amount))
+                          else 0)
                 
                 days = random.choice([2, 2, 2, 3, 3, 4, 5])
                 
@@ -866,44 +887,49 @@ class StockDataService:
             cached = self._get_cached_data("sectors")
             if cached and not self.is_trading_time():
                 return cached
-            
-            try:
-                df_sector = ak.stock_sector_spot()
-                if df_sector is not None and len(df_sector) > 0:
-                    sector_list = []
-                    for _, row in df_sector.head(15).iterrows():
-                        sector_list.append({
-                            "name": str(row.get('板块', row.get('label', '')))[:8],
-                            "change_percent": round(float(row.get('个股-涨跌幅', 0)), 2),
-                            "limit_up_count": 0,
-                            "hot": float(row.get('个股-涨跌幅', 0)) >= 2,
-                            "days": 1
-                        })
-                    
-                    sector_list.sort(key=lambda x: x["change_percent"], reverse=True)
-                    hot_sectors = [s for s in sector_list if s["hot"]]
-                    
-                    # 加载保存的题材轮动分析数据
-                    rotation_data = self._load_rotation_analysis()
-                    
-                    result = {
-                        "timestamp": datetime.now().isoformat(),
-                        "sectors": sector_list,
-                        "hot_sectors": hot_sectors[:8],
-                        "sector_rotation": rotation_data
-                    }
-                    
-                    self._save_cached_data("sectors", result)
-                    return result
-            except Exception as e:
-                logger.warning(f"获取板块数据失败: {e}")
-            
+
+            df_sector = None
+            if ak is None:
+                logger.debug("akshare 未安装, 跳过板块实时抓取")
+            else:
+                try:
+                    df_sector = ak.stock_sector_spot()
+                except Exception as e:
+                    logger.warning(f"获取板块数据失败: {e}")
+
+            if df_sector is not None and len(df_sector) > 0:
+                sector_list = []
+                for _, row in df_sector.head(15).iterrows():
+                    sector_list.append({
+                        "name": str(row.get('板块', row.get('label', '')))[:8],
+                        "change_percent": round(float(row.get('个股-涨跌幅', 0)), 2),
+                        "limit_up_count": 0,
+                        "hot": float(row.get('个股-涨跌幅', 0)) >= 2,
+                        "days": 1
+                    })
+
+                sector_list.sort(key=lambda x: x["change_percent"], reverse=True)
+                hot_sectors = [s for s in sector_list if s["hot"]]
+
+                # 加载保存的题材轮动分析数据
+                rotation_data = self._load_rotation_analysis()
+
+                result = {
+                    "timestamp": datetime.now().isoformat(),
+                    "sectors": sector_list,
+                    "hot_sectors": hot_sectors[:8],
+                    "sector_rotation": rotation_data
+                }
+
+                self._save_cached_data("sectors", result)
+                return result
+
             fallback_data = await self._get_fallback_sector_analysis()
             # 加载保存的题材轮动分析数据
             rotation_data = self._load_rotation_analysis()
             fallback_data["sector_rotation"] = rotation_data
             return fallback_data
-            
+
         except Exception as e:
             logger.error(f"获取题材数据失败: {e}", exc_info=True)
             return {"timestamp": datetime.now().isoformat(), "sectors": [], "hot_sectors": [], "sector_rotation": []}

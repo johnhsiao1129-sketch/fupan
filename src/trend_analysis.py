@@ -6,17 +6,38 @@
 
 import logging
 import sqlite3
-import requests
-import pandas as pd
-import numpy as np
 import time
 import random
 import asyncio
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
 from data.database import DB_PATH
 import os
+
+if TYPE_CHECKING:
+    import requests  # type: ignore[import-not-found]
+    import pandas as pd  # type: ignore[import-not-found]
+    import numpy as np  # type: ignore[import-not-found]
+
+# 网络/外部库改为可选依赖
+try:
+    import requests  # type: ignore[assignment]
+except ImportError:
+    requests = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("requests 未安装, 趋势票 K 线抓取不可用")
+
+try:
+    import pandas as pd  # type: ignore[assignment]
+except ImportError:
+    pd = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("pandas 未安装, 趋势票数据处理受限")
+
+try:
+    import numpy as np  # type: ignore[assignment]
+except ImportError:
+    np = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("numpy 未安装, 趋势票计算受限")
 
 logger = logging.getLogger(__name__)
 

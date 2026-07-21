@@ -27,15 +27,49 @@ import random
 import time
 import threading
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, TYPE_CHECKING
 from functools import wraps
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-    before_sleep_log,
-)
+
+if TYPE_CHECKING:
+    from tenacity import (  # type: ignore[import-not-found]
+        retry,
+        stop_after_attempt,
+        wait_exponential,
+        retry_if_exception_type,
+        before_sleep_log,
+    )
+
+# tenacity 可选依赖：缺失时退化为无重试版（仅打 log）
+try:
+    from tenacity import (  # type: ignore[assignment]
+        retry,
+        stop_after_attempt,
+        wait_exponential,
+        retry_if_exception_type,
+        before_sleep_log,
+    )
+    _TENACITY_AVAILABLE = True
+except ImportError:
+    _TENACITY_AVAILABLE = False
+    logging.getLogger(__name__).warning("tenacity 未安装, 速率限制器失去自动重试能力 (本地兜底走单次)")
+
+    # 提供 no-op 占位装饰器, 避免调用方崩溃
+    def retry(*_args, **_kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+    def stop_after_attempt(*_args, **_kwargs):
+        return None
+
+    def wait_exponential(*_args, **_kwargs):
+        return None
+
+    def retry_if_exception_type(*_args, **_kwargs):
+        return None
+
+    def before_sleep_log(*_args, **_kwargs):
+        return None
 
 logger = logging.getLogger(__name__)
 

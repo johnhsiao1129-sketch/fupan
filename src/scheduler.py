@@ -5,8 +5,27 @@
 import logging
 import asyncio
 from datetime import datetime, time
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from src.data_acquisition import DataAcquisitionService
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-not-found]
+
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[assignment]
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    AsyncIOScheduler = None  # type: ignore[assignment,misc]
+    _APSCHEDULER_AVAILABLE = False
+    logging.getLogger(__name__).warning("apscheduler 未安装, 定时任务调度器不可用 (本地浏览仍正常)")
+
+# data_acquisition 内部依赖 akshare/requests/pandas, 离线时可能不可用
+# 延迟导入, 启动时不强依赖
+try:
+    from src.data_acquisition import DataAcquisitionService  # type: ignore[assignment]
+except ImportError as e:
+    DataAcquisitionService = None  # type: ignore[assignment,misc]
+    logging.getLogger(__name__).warning(f"data_acquisition 导入失败 ({e}), 定时任务将跳过数据采集")
+
 from src.db_operations import get_last_trading_day, is_trading_day
 
 logging.basicConfig(
@@ -25,8 +44,16 @@ class DataAcquisitionScheduler:
     """数据获取调度器"""
 
     def __init__(self):
+        if not _APSCHEDULER_AVAILABLE or AsyncIOScheduler is None:
+            self.scheduler = None
+            self.data_service = None
+            logger.warning("定时任务调度器不可用, 跳过初始化")
+            return
         self.scheduler = AsyncIOScheduler(timezone='Asia/Shanghai')
-        self.data_service = DataAcquisitionService()
+        self.data_service = DataAcquisitionService() if DataAcquisitionService is not None else None
+        if self.data_service is None:
+            logger.warning("DataAcquisitionService 不可用, 定时任务将不抓取数据")
+            return
         self.setup_jobs()
 
     def setup_jobs(self):
