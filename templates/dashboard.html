@@ -4127,6 +4127,47 @@
         .intraday-time-modal-btn.primary:hover {
             background: #3dbdb5;
         }
+
+        /* 溢价模式开关 (iOS 风格 toggle) */
+        .premium-toggle {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            font-size: 9px;
+            color: #ccc;
+            user-select: none;
+        }
+        .premium-toggle .switch {
+            position: relative;
+            width: 28px;
+            height: 14px;
+            background: #444;
+            border-radius: 7px;
+            transition: background 0.2s;
+            flex-shrink: 0;
+        }
+        .premium-toggle .switch::after {
+            content: '';
+            position: absolute;
+            top: 1px;
+            left: 1px;
+            width: 12px;
+            height: 12px;
+            background: #fff;
+            border-radius: 50%;
+            transition: transform 0.2s;
+        }
+        .premium-toggle input:checked ~ .switch {
+            background: #4ecdc4;
+        }
+        .premium-toggle input:checked ~ .switch::after {
+            transform: translateX(14px);
+        }
+        .premium-toggle input {
+            display: none;
+        }
     </style>
 </head>
 
@@ -6297,6 +6338,13 @@ let todayStockFilter = ''; // 今日首板板块的股票筛选关键字
 let enableTopicHeightSort = localStorage.getItem('enableTopicHeightSort') === 'true'; // 今日首板题材卡片高度排序开关（从localStorage读取）
 let topicHeightSortCache = null; // 缓存高度排序后的题材顺序（按题材ID数组）
 let topicHeightSortCacheDate = ''; // 缓存排序的日期
+let premiumMode = false; // 溢价模式开关（false=今日首板模式，true=昨日溢价模式）
+let premiums = []; // 溢价数据缓存
+let premiumLimitDate = ''; // 溢价数据的首板日期
+let todayFirstLimitsData = []; // 今日首板原始数据缓存（用于溢价模式重渲染）
+let todayFirstLimitsIsTrading = false; // 是否盘中交易
+let savedTodayFirstLimitsData = null; // 溢价模式切换时保存的"今日"首板数据
+let savedTodayTopics = null; // 溢价模式切换时保存的"今日"题材数据
 
         // 统一日期选择器的板块列表
         const DATE_AFFECTED_BLOCKS = ['limit_stats', 'market_summary', 'continuous_limits'];
@@ -6859,6 +6907,12 @@ async function refreshTodayFirstLimits(enableSort = false) {
 
 
                  // 重新渲染今日首板板块
+                 // 缓存数据供溢价模式重渲染使用
+                 todayFirstLimitsData = data.first_limits || [];
+                 todayFirstLimitsIsTrading = data.is_trading || false;
+                 // 刷新后清空 saved 状态，避免溢价模式切换时用脏数据
+                 savedTodayFirstLimitsData = null;
+                 savedTodayTopics = null;
                  const firstLimitsHtml = renderFirstLimits(data.first_limits, data.is_trading || false, enableSort);
 
                 // 更新DOM：找到今日首板板块的card元素并替换
@@ -6898,6 +6952,12 @@ async function refreshTodayFirstLimits(enableSort = false) {
                 // 应用前端筛选（在 DOM 更新后）
                 if (todayStockFilter) {
                     filterTodayStocksFrontend();
+                }
+
+                // 如果溢价模式开启，获取溢价数据
+                if (premiumMode) {
+                    await fetchPremiumData();
+                    renderTodayFirstLimits();
                 }
 
             } catch (error) {
@@ -6954,6 +7014,13 @@ async function refreshTodayFirstLimits(enableSort = false) {
                 }
 
                 if (result.success) {
+                    // 捕获溢价数据
+                    if (result.premiums && result.premiums.length > 0) {
+                        premiums = result.premiums;
+                        premiumLimitDate = result.premium_limit_date || premiumLimitDate;
+                        console.log('[盘中刷新] 获取溢价数据:', premiums.length, '条');
+                    }
+
                     let alertMessage = '✅ 盘中刷新成功！\n\n';
                     alertMessage += '📊 数据统计：\n';
                     alertMessage += '  首板: ' + result.first_limit_count + '\n';
@@ -6999,6 +7066,13 @@ async function refreshTodayFirstLimits(enableSort = false) {
         async function renderDashboard(data) {
             // 保存显示交易日期
             displayTradeDate = data.display_date || '';
+
+            // 缓存首板数据，供溢价模式重渲染使用（与 refreshTodayFirstLimits 保持一致）
+            todayFirstLimitsData = data.first_limits || [];
+            todayFirstLimitsIsTrading = data.is_trading || false;
+            // 刷新后清空 saved 状态，避免溢价模式切换时用脏数据
+            savedTodayFirstLimitsData = null;
+            savedTodayTopics = null;
 
 // 保存今日题材数据
         // 保存今日题材数据
@@ -11854,14 +11928,26 @@ function renderFirstLimits(firstLimits, isTrading = false, enableSort = true) {
     // 不再在这里重复排序，避免用户操作时丢失顺序
     let sortedTopics = [...todayTopics];
 
+    // 溢价模式相关
+    const isPremiumMode = typeof premiumMode !== 'undefined' && premiumMode;
+    const premiumTitle = isPremiumMode 
+        ? `📈 昨日溢价 (${premiumLimitDate || '上一交易日'}→${displayTradeDate || '今日'}, ${premiums.length}个)`
+        : `🆕 今日首板 (${displayStocks.length}个)`;
+
     return `
-                   <div class="card">
+                   <div class="card" data-card-type="today-first-limits">
                         <div class="card-title">
                              <div style="display: flex; align-items: center; gap: 12px; padding-left: 12px;">
-                                 <span>🆕 今日首板 (${displayStocks.length}个)</span>
+                                 <span id="firstLimitsTitle">${premiumTitle}</span>
                                  <span class="help-icon" onclick="showTodayFirstLimitsHelp()" title="点击查看使用说明">?</span>
                              </div>
                                <div style="display: flex; gap: 8px; align-items: center;">
+<!-- 溢价模式开关 -->
+                                    <label class="premium-toggle">
+                                        <input type="checkbox" id="premiumModeToggle" ${isPremiumMode ? 'checked' : ''} onchange="togglePremiumMode()">
+                                        <span class="switch"></span>
+                                        <span id="premiumModeLabel">${isPremiumMode ? '今日首板' : '昨日溢价'}</span>
+                                    </label>
                                    <!-- 高度排序开关 -->
                                    <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 9px; color: #888;">
                                        <input type="checkbox" id="topicHeightSortToggle" ${enableTopicHeightSort ? 'checked' : ''} onchange="toggleTopicHeightSort()" style="cursor: pointer;">
@@ -11894,10 +11980,20 @@ function renderFirstLimits(firstLimits, isTrading = false, enableSort = true) {
                              ${displayStocks.length === 0
                      ? '<div style="text-align: center; color: #888; font-size: 10px; padding: 20px;">今日暂无首板数据</div>'
                      : `<div class="stocks-grid">
-                                     ${displayStocks.map(stock => `
+                                     ${displayStocks.map(stock => {
+                                         // 根据模式决定涨跌幅显示
+                                         let changeContent = '';
+                                         if (premiumMode) {
+                                             const premium = getPremiumByCode(stock.code);
+                                             const cp = premium ? premium.change_percent : null;
+                                             changeContent = `<span style="${getChangePercentStyle(cp)}">${formatChangePercent(cp)}</span>`;
+                                         } else {
+                                             changeContent = `<span style="color: #ff4757;">+${stock.change_percent}%</span>`;
+                                         }
+                                         return `
                                          <div class="stock-mini-card"
-                                              draggable="true"
-                                              ondragstart="dragStart(event, '${stock.code}', '${stock.name}', '${stock.first_time}'${stock.id ? `, '${stock.id}'` : ''}${stock.stock_id ? `, '${stock.stock_id}'` : ''})"
+                                              draggable="${premiumMode ? 'false' : 'true'}"
+                                              ondragstart="${premiumMode ? '' : `dragStart(event, '${stock.code}', '${stock.name}', '${stock.first_time}'${stock.id ? `, '${stock.id}'` : ''}${stock.stock_id ? `, '${stock.stock_id}'` : ''})`}"
                                               data-code="${stock.code}"
                                               data-name="${stock.name}"
                                               data-time="${stock.first_time}"
@@ -11905,14 +12001,14 @@ function renderFirstLimits(firstLimits, isTrading = false, enableSort = true) {
                                               data-stock-id="${stock.stock_id || ''}">
                                              <div class="stock-mini-name">${stock.name}</div>
                                              <div class="stock-mini-row">
-                                                 <span>+${stock.change_percent}%</span>
+                                                 ${changeContent}
                                                  <span class="stock-mini-change">${stock.first_time}</span>
                                              </div>
                                              <div class="stock-mini-row">
                                                  <span>${stock.sector || ''}</span>
                                              </div>
-                                         </div>
-                                     `).join('')}
+                                         </div>`;
+                                     }).join('')}
                                  </div>`
                  }
                          </div>
@@ -11926,19 +12022,19 @@ function renderFirstLimits(firstLimits, isTrading = false, enableSort = true) {
             '阿': 'A', '翱': 'A', '鞍': 'A', '艾': 'A', '鞍': 'A', '傲': 'A', '啊': 'A', '埃': 'A', '挨': 'A', '哎': 'A', '唉': 'A', '爱': 'A', '安': 'A', '氨': 'A', '俺': 'A', '按': 'A', '暗': 'A', '岸': 'A', '胺': 'A', '案': 'A', '昂': 'A', '奥': 'A', '懊': 'A', '袄': 'A', '澳': 'A', '拗': 'A',
             '八': 'B', '奔': 'B','碧': 'B','播': 'B', '霸': 'B', '半': 'B', '柏': 'B', '铂': 'B', '巴': 'B', '扒': 'B', '渤': 'B', '叭': 'B', '玻': 'B', '吧': 'B', '罢': 'B', '爸': 'B', '白': 'B', '百': 'B', '摆': 'B', '佰': 'B', '败': 'B', '拜': 'B', '班': 'B', '搬': 'B', '斑': 'B', '般': 'B', '颁': 'B', '板': 'B', '版': 'B', '扮': 'B', '拌': 'B', '伴': 'B', '瓣': 'B', '邦': 'B', '帮': 'B', '梆': 'B', '榜': 'B', '膀': 'B', '绑': 'B', '棒': 'B', '磅': 'B', '包': 'B', '报': 'B', '抱': 'B', '豹': 'B', '鲍': 'B', '暴': 'B', '宝': 'B', '保': 'B', '堡': 'B', '饱': 'B', '北': 'B', '备': 'B', '背': 'B', '贝': 'B', '倍': 'B', '被': 'B', '笨': 'B', '本': 'B', '崩': 'B', '绷': 'B', '甭': 'B', '泵': 'B', '逼': 'B', '鼻': 'B', '比': 'B', '笔': 'B', '彼': 'B', '必': 'B', '闭': 'B', '壁': 'B', '避': 'B', '臂': 'B', '边': 'B', '编': 'B', '贬': 'B', '扁': 'B', '便': 'B', '变': 'B', '遍': 'B', '辨': 'B', '辩': 'B', '标': 'B', '彪': 'B', '膘': 'B', '表': 'B', '别': 'B', '宾': 'B', '彬': 'B', '斌': 'B', '滨': 'B', '兵': 'B', '冰': 'B', '并': 'B', '病': 'B', '拨': 'B', '波': 'B', '博': 'B', '搏': 'B', '勃': 'B', '伯': 'B', '泊': 'B', '驳': 'B', '卜': 'B', '补': 'B', '捕': 'B', '不': 'B', '布': 'B', '步': 'B', '部': 'B',
             '猜': 'C', '齿': 'C', '铖': 'C', '赐': 'C', '淳': 'C', '重': 'C', '晟': 'C', '瓷': 'C', '才': 'C', '材': 'C', '船': 'C', '醋': 'C', '财': 'C', '裁': 'C', '采': 'C', '彩': 'C', '菜': 'C', '蔡': 'C', '参': 'C', '蚕': 'C', '残': 'C', '惨': 'C', '灿': 'C', '苍': 'C', '仓': 'C', '沧': 'C', '藏': 'C', '操': 'C', '糙': 'C', '曹': 'C', '草': 'C', '侧': 'C', '册': 'C', '测': 'C', '层': 'C', '蹭': 'C', '曾': 'C', '叉': 'C', '插': 'C', '查': 'C', '茶': 'C', '察': 'C', '岔': 'C', '差': 'C', '拆': 'C', '柴': 'C', '禅': 'C', '缠': 'C', '蝉': 'C', '产': 'C', '阐': 'C', '颤': 'C', '铲': 'C', '昌': 'C', '场': 'C', '肠': 'C', '常': 'C', '长': 'C', '厂': 'C', '敞': 'C', '畅': 'C', '倡': 'C', '唱': 'C', '抄': 'C', '超': 'C', '绰': 'C', '朝': 'C', '潮': 'C', '巢': 'C', '吵': 'C', '炒': 'C', '车': 'C', '扯': 'C', '撤': 'C', '彻': 'C', '臣': 'C', '辰': 'C', '尘': 'C', '晨': 'C', '陈': 'C', '衬': 'C', '称': 'C', '趁': 'C', '撑': 'C', '城': 'C', '成': 'C', '呈': 'C', '诚': 'C', '承': 'C', '乘': 'C', '程': 'C', '惩': 'C', '澄': 'C', '橙': 'C', '吃': 'C', '持': 'C', '池': 'C', '迟': 'C', '驰': 'C', '齿': 'C', '尺': 'C', '赤': 'C', '翅': 'C', '斥': 'C', '炽': 'C', '充': 'C', '冲': 'C', '虫': 'C', '崇': 'C', '宠': 'C', '抽': 'C', '仇': 'C', '绸': 'C', '畴': 'C', '稠': 'C', '愁': 'C', '筹': 'C', '酬': 'C', '臭': 'C', '出': 'C', '初': 'C', '除': 'C', '厨': 'C', '础': 'C', '储': 'C', '川': 'C', '穿': 'C', '传': 'C', '船': 'C', '喘': 'C', '串': 'C', '创': 'C', '吹': 'C', '炊': 'C', '垂': 'C', '锤': 'C', '春': 'C', '纯': 'C', '醇': 'C', '辍': 'C', '辞': 'C', '词': 'C', '磁': 'C', '雌': 'C', '次': 'C', '从': 'C', '丛': 'C', '粗': 'C', '促': 'C', '簇': 'C', '醋': 'C', '窜': 'C', '篡': 'C', '崔': 'C', '催': 'C', '脆': 'C', '粹': 'C', '翠': 'C', '村': 'C', '存': 'C', '寸': 'C',
-            '搭': 'D', '岱': 'D', '黛': 'D', '动': 'D', '锝': 'D', '顿': 'D', '德': 'D', '达': 'D', '答': 'D', '大': 'D', '呆': 'D', '歹': 'D', '代': 'D', '袋': 'D', '戴': 'D', '贷': 'D', '丹': 'D', '单': 'D', '担': 'D', '耽': 'D', '胆': 'D', '弹': 'D', '淡': 'D', '蛋': 'D', '氮': 'D', '当': 'D', '挡': 'D', '党': 'D', '刀': 'D', '倒': 'D', '岛': 'D', '导': 'D', '到': 'D', '道': 'D', '稻': 'D', '得': 'D', '灯': 'D', '登': 'D', '等': 'D', '低': 'D', '滴': 'D', '迪': 'D', '敌': 'D', '笛': 'D', '涤': 'D', '底': 'D', '抵': 'D', '地': 'D', '弟': 'D', '递': 'D', '帝': 'D', '蒂': 'D', '缔': 'D', '典': 'D', '点': 'D', '电': 'D', '店': 'D', '垫': 'D', '淀': 'D', '殿': 'D', '雕': 'D', '掉': 'D', '吊': 'D', '钓': 'D', '跌': 'D', '爹': 'D', '碟': 'D', '蝶': 'D', '迭': 'D', '谍': 'D', '丁': 'D', '盯': 'D', '叮': 'D', '钉': 'D', '顶': 'D', '鼎': 'D', '定': 'D', '东': 'D', '冬': 'D', '董': 'D', '懂': 'D', '动': 'D', '冻': 'D', '栋': 'D', '洞': 'D', '都': 'D', '斗': 'D', '抖': 'D', '陡': 'D', '豆': 'D', '逗': 'D', '督': 'D', '毒': 'D', '读': 'D', '独': 'D', '堵': 'D', '赌': 'D', '杜': 'D', '镀': 'D', '端': 'D', '短': 'D', '段': 'D', '断': 'D', '锻': 'D', '堆': 'D', '兑': 'D', '队': 'D', '对': 'D', '吨': 'D', '敦': 'D', '顿': 'D', '盾': 'D', '多': 'D', '夺': 'D', '朵': 'D', '跺': 'D',
+            '搭': 'D', '度': 'D', '岱': 'D', '黛': 'D', '动': 'D', '锝': 'D', '顿': 'D', '德': 'D', '达': 'D', '答': 'D', '大': 'D', '呆': 'D', '歹': 'D', '代': 'D', '袋': 'D', '戴': 'D', '贷': 'D', '丹': 'D', '单': 'D', '担': 'D', '耽': 'D', '胆': 'D', '弹': 'D', '淡': 'D', '蛋': 'D', '氮': 'D', '当': 'D', '挡': 'D', '党': 'D', '刀': 'D', '倒': 'D', '岛': 'D', '导': 'D', '到': 'D', '道': 'D', '稻': 'D', '得': 'D', '灯': 'D', '登': 'D', '等': 'D', '低': 'D', '滴': 'D', '迪': 'D', '敌': 'D', '笛': 'D', '涤': 'D', '底': 'D', '抵': 'D', '地': 'D', '弟': 'D', '递': 'D', '帝': 'D', '蒂': 'D', '缔': 'D', '典': 'D', '点': 'D', '电': 'D', '店': 'D', '垫': 'D', '淀': 'D', '殿': 'D', '雕': 'D', '掉': 'D', '吊': 'D', '钓': 'D', '跌': 'D', '爹': 'D', '碟': 'D', '蝶': 'D', '迭': 'D', '谍': 'D', '丁': 'D', '盯': 'D', '叮': 'D', '钉': 'D', '顶': 'D', '鼎': 'D', '定': 'D', '东': 'D', '冬': 'D', '董': 'D', '懂': 'D', '动': 'D', '冻': 'D', '栋': 'D', '洞': 'D', '都': 'D', '斗': 'D', '抖': 'D', '陡': 'D', '豆': 'D', '逗': 'D', '督': 'D', '毒': 'D', '读': 'D', '独': 'D', '堵': 'D', '赌': 'D', '杜': 'D', '镀': 'D', '端': 'D', '短': 'D', '段': 'D', '断': 'D', '锻': 'D', '堆': 'D', '兑': 'D', '队': 'D', '对': 'D', '吨': 'D', '敦': 'D', '顿': 'D', '盾': 'D', '多': 'D', '夺': 'D', '朵': 'D', '跺': 'D',
             '讹': 'E', '蒽': 'E', '俄': 'E', '额': 'E', '鹅': 'E', '蛾': 'E', '恶': 'E', '饿': 'E', '厄': 'E', '扼': 'E', '遏': 'E', '鄂': 'E', '恩': 'E', '而': 'E', '儿': 'E', '耳': 'E', '二': 'E', '尔': 'E',
             '发': 'F', '富': 'F', '氟': 'F', '风': 'F', '纺': 'F', '涪': 'F', '汾': 'F', '坊': 'F', '烽': 'F', '服': 'F', '芳': 'F', '孚': 'F', '罚': 'F', '阀': 'F', '法': 'F', '方': 'F', '帆': 'F', '番': 'F', '翻': 'F', '凡': 'F', '钒': 'F', '防': 'F', '妨': 'F', '房': 'F', '仿': 'F', '访': 'F', '菲': 'F', '非': 'F', '啡': 'F', '飞': 'F', '肥': 'F', '匪': 'F', '诽': 'F', '吠': 'F', '肺': 'F', '废': 'F', '沸': 'F', '费': 'F', '酚': 'F', '分': 'F', '纷': 'F', '芬': 'F', '氛': 'F', '坟': 'F', '焚': 'F', '粉': 'F', '份': 'F', '奋': 'F', '愤': 'F', '粪': 'F', '丰': 'F', '封': 'F', '枫': 'F', '蜂': 'F', '峰': 'F', '锋': 'F', '风': 'F', '疯': 'F', '逢': 'F', '冯': 'F', '缝': 'F', '讽': 'F', '奉': 'F', '凤': 'F', '佛': 'F', '夫': 'F', '敷': 'F', '肤': 'F', '孵': 'F', '弗': 'F', '拂': 'F', '伏': 'F', '俘': 'F', '浮': 'F', '福': 'F', '幅': 'F', '辐': 'F', '甫': 'F', '抚': 'F', '辅': 'F', '俯': 'F', '釜': 'F', '斧': 'F', '脯': 'F', '腐': 'F', '腑': 'F', '赴': 'F', '副': 'F', '覆': 'F', '复': 'F', '赋': 'F', '傅': 'F', '富': 'F', '腹': 'F',
             '该': 'G', '锆': 'G', '贡': 'G', '改': 'G', '盖': 'G', '钙': 'G', '概': 'G', '干': 'G', '杆': 'G', '肝': 'G', '甘': 'G', '感': 'G', '赶': 'G', '敢': 'G', '赣': 'G', '冈': 'G', '刚': 'G', '钢': 'G', '缸': 'G', '肛': 'G', '岗': 'G', '港': 'G', '杠': 'G', '高': 'G', '搞': 'G', '稿': 'G', '告': 'G', '歌': 'G', '搁': 'G', '戈': 'G', '鸽': 'G', '割': 'G', '革': 'G', '格': 'G', '葛': 'G', '蛤': 'G', '隔': 'G', '阁': 'G', '铬': 'G', '各': 'G', '给': 'G', '根': 'G', '跟': 'G', '耕': 'G', '更': 'G', '庚': 'G', '羹': 'G', '耿': 'G', '梗': 'G', '工': 'G', '攻': 'G', '功': 'G', '恭': 'G', '供': 'G', '公': 'G', '宫': 'G', '共': 'G', '钩': 'G', '沟': 'G', '狗': 'G', '构': 'G', '购': 'G', '垢': 'G', '够': 'G', '鼓': 'G', '古': 'G', '谷': 'G', '股': 'G', '故': 'G', '顾': 'G', '固': 'G', '雇': 'G', '刮': 'G', '瓜': 'G', '挂': 'G', '褂': 'G', '乖': 'G', '拐': 'G', '怪': 'G', '关': 'G', '观': 'G', '官': 'G', '冠': 'G', '馆': 'G', '管': 'G', '罐': 'G', '惯': 'G', '灌': 'G', '贯': 'G', '光': 'G', '广': 'G', '逛': 'G', '瑰': 'G', '规': 'G', '硅': 'G', '归': 'G', '轨': 'G', '鬼': 'G', '诡': 'G', '桂': 'G', '柜': 'G', '跪': 'G', '贵': 'G', '辊': 'G', '滚': 'G', '棍': 'G', '锅': 'G', '郭': 'G', '国': 'G', '过': 'G',
             '哈': 'H', '癀': 'H', '癀': 'H', '会': 'H', '辉': 'H', '昊': 'H', '鹄': 'H', '淮': 'H', '泓': 'H', '行': 'H', '壕': 'H', '会': 'H', '灏': 'H', '晖': 'H', '豪': 'H', '海': 'H', '害': 'H', '汇': 'H', '汉': 'H', '韩': 'H', '含': 'H', '寒': 'H', '函': 'H', '喊': 'H', '旱': 'H', '焊': 'H', '撼': 'H', '悍': 'H', '汗': 'H', '航': 'H', '号': 'H', '浩': 'H', '耗': 'H', '好': 'H', '郝': 'H', '河': 'H', '何': 'H', '合': 'H', '盒': 'H', '核': 'H', '禾': 'H', '和': 'H', '贺': 'H', '赫': 'H', '褐': 'H', '鹤': 'H', '黑': 'H', '痕': 'H', '很': 'H', '恨': 'H', '哼': 'H', '亨': 'H', '横': 'H', '衡': 'H', '恒': 'H', '红': 'H', '宏': 'H', '洪': 'H', '哄': 'H', '虹': 'H', '鸿': 'H', '侯': 'H', '喉': 'H', '猴': 'H', '吼': 'H', '厚': 'H', '候': 'H', '呼': 'H', '忽': 'H', '壶': 'H', '狐': 'H', '胡': 'H', '湖': 'H', '蝴': 'H', '糊': 'H', '虎': 'H', '护': 'H', '互': 'H', '沪': 'H', '户': 'H', '花': 'H', '华': 'H', '画': 'H', '话': 'H', '划': 'H', '化': 'H', '怀': 'H', '坏': 'H', '欢': 'H', '还': 'H', '环': 'H', '患': 'H', '荒': 'H', '黄': 'H', '皇': 'H', '煌': 'H', '晃': 'H', '挥': 'H', '辉': 'H', '徽': 'H', '回': 'H', '悔': 'H', '慧': 'H', '晦': 'H', '惠': 'H', '毁': 'H', '昏': 'H', '混': 'H', '魂': 'H', '浑': 'H', '豁': 'H', '活': 'H', '火': 'H', '伙': 'H', '或': 'H', '货': 'H', '祸': 'H', '获': 'H', '霍': 'H', '杭': 'H', '航': 'H', '弘': 'H', '瀚': 'H',
             '机': 'J', '荆': 'J', '检': 'J', '均': 'J', '锦': 'J', '界': 'J', '玑': 'J', '军': 'J', '教': 'J', '迦': 'J', '憬': 'J', '疆': 'J', '箭': 'J', '炬': 'J', '珈': 'J', '激': 'J', '居': 'J', '稽': 'J', '窖': 'J', '锦': 'J', '景': 'J', '璟': 'J', '境': 'J', '钧': 'J', '解': 'J', '菌': 'J', '具': 'J', '洁': 'J', '捷': 'J', '锦': 'J', '觉': 'J', '肌': 'J', '饥': 'J', '精': 'J', '杰': 'J', '机': 'J', '基': 'J', '积': 'J', '畸': 'J', '稽': 'J', '姬': 'J', '绩': 'J', '缉': 'J', '吉': 'J', '极': 'J', '棘': 'J', '辑': 'J', '籍': 'J', '集': 'J', '及': 'J', '急': 'J', '疾': 'J', '即': 'J', '嫉': 'J', '挤': 'J', '几': 'J', '脊': 'J', '己': 'J', '技': 'J', '冀': 'J', '季': 'J', '祭': 'J', '剂': 'J', '悸': 'J', '济': 'J', '寄': 'J', '计': 'J', '记': 'J', '纪': 'J', '忌': 'J', '际': 'J', '继': 'J', '嘉': 'J', '夹': 'J', '佳': 'J', '家': 'J', '加': 'J', '甲': 'J', '价': 'J', '架': 'J', '驾': 'J', '嫁': 'J', '歼': 'J', '监': 'J', '坚': 'J', '尖': 'J', '间': 'J', '肩': 'J', '艰': 'J', '兼': 'J', '煎': 'J', '拣': 'J', '捡': 'J', '俭': 'J', '柬': 'J', '简': 'J', '碱': 'J', '见': 'J', '件': 'J', '建': 'J', '荐': 'J', '剑': 'J', '健': 'J', '舰': 'J', '渐': 'J', '溅': 'J', '践': 'J', '键': 'J', '姜': 'J', '将': 'J', '浆': 'J', '僵': 'J', '酱': 'J', '江': 'J', '蒋': 'J', '奖': 'J', '讲': 'J', '匠': 'J', '交': 'J', '郊': 'J', '胶': 'J', '焦': 'J', '椒': 'J', '礁': 'J', '角': 'J', '脚': 'J', '搅': 'J', '缴': 'J', '矫': 'J', '绞': 'J', '剿': 'J', '较': 'J', '轿': 'J', '叫': 'J', '接': 'J', '揭': 'J', '街': 'J', '节': 'J', '借': 'J', '届': 'J', '阶': 'J', '巾': 'J', '筋': 'J', '斤': 'J', '金': 'J', '今': 'J', '津': 'J', '紧': 'J', '仅': 'J', '谨': 'J', '锦': 'J', '尽': 'J', '劲': 'J', '进': 'J', '近': 'J', '浸': 'J', '晋': 'J', '禁': 'J', '京': 'J', '经': 'J', '茎': 'J', '惊': 'J', '晶': 'J', '睛': 'J', '井': 'J', '警': 'J', '净': 'J', '径': 'J', '痉': 'J', '竞': 'J', '久': 'J', '灸': 'J', '九': 'J', '酒': 'J', '旧': 'J', '救': 'J', '就': 'J', '舅': 'J', '拘': 'J', '菊': 'J', '橘': 'J', '局': 'J', '举': 'J', '矩': 'J', '巨': 'J', '句': 'J', '聚': 'J', '拒': 'J', '据': 'J', '锯': 'J', '剧': 'J', '俱': 'J', '惧': 'J', '炬': 'J', '俊': 'J', '骏': 'J',
             '开': 'K', '恺': 'K', '柯': 'K', '会': 'K', '凯': 'K', '楷': 'K', '慨': 'K', '刊': 'K', '坎': 'K', '砍': 'K', '看': 'K', '康': 'K', '慷': 'K', '糠': 'K', '抗': 'K', '亢': 'K', '炕': 'K', '考': 'K', '烤': 'K', '靠': 'K', '苛': 'K', '科': 'K', '棵': 'K', '颗': 'K', '咳': 'K', '可': 'K', '渴': 'K', '克': 'K', '刻': 'K', '客': 'K', '肯': 'K', '恳': 'K', '坑': 'K', '空': 'K', '孔': 'K', '恐': 'K', '控': 'K', '抠': 'K', '口': 'K', '扣': 'K', '寇': 'K', '苦': 'K', '库': 'K', '裤': 'K', '酷': 'K', '夸': 'K', '垮': 'K', '跨': 'K', '块': 'K', '快': 'K', '筷': 'K', '宽': 'K', '款': 'K', '狂': 'K', '况': 'K', '旷': 'K', '矿': 'K', '框': 'K', '眶': 'K', '亏': 'K', '奎': 'K', '葵': 'K', '馈': 'K', '溃': 'K', '坤': 'K', '昆': 'K', '捆': 'K', '困': 'K', '扩': 'K', '廓': 'K',
-            '拉': 'L', '禄': 'L', '伦': 'L', '螂': 'L', '榈': 'L', '络': 'L', '洛': 'L', '菱': 'L', '霖': 'L', '力': 'L', '陵': 'L', '岭': 'L', '凌': 'L', '铝': 'L', '领': 'L', '陵': 'L', '琏': 'L', '锂': 'L', '陇': 'L', '丽': 'L', '轮': 'L', '罗': 'L', '滦': 'L', '潞': 'L', '朗': 'L', '旅': 'L', '立': 'L', '洛': 'L', '莱': 'L', '零': 'L', '来': 'L', '蜡': 'L', '利': 'L', '腊': 'L', '辣': 'L', '鹭': 'L', '蓝': 'L', '栏': 'L', '拦': 'L', '篮': 'L', '兰': 'L', '澜': 'L', '览': 'L', '揽': 'L', '缆': 'L', '烂': 'L', '滥': 'L', '琅': 'L', '郎': 'L', '狼': 'L', '廊': 'L', '浪': 'L', '捞': 'L', '劳': 'L', '牢': 'L', '老': 'L', '佬': 'L', '姥': 'L', '酪': 'L', '涝': 'L', '烙': 'L', '乐': 'L', '勒': 'L', '雷': 'L', '镭': 'L', '垒': 'L', '磊': 'L', '肋': 'L', '泪': 'L', '类': 'L', '累': 'L', '棱': 'L', '冷': 'L', '愣': 'L', '厘': 'L', '梨': 'L', '离': 'L', '莉': 'L', '理': 'L', '里': 'L', '力': 'L', '历': 'L', '沥': 'L', '联': 'L', '莲': 'L', '连': 'L', '镰': 'L', '廉': 'L', '怜': 'L', '敛': 'L', '脸': 'L', '链': 'L', '恋': 'L', '炼': 'L', '练': 'L', '粮': 'L', '凉': 'L', '梁': 'L', '良': 'L', '两': 'L', '辆': 'L', '量': 'L', '亮': 'L', '谅': 'L', '辽': 'L', '疗': 'L', '燎': 'L', '聊': 'L', '了': 'L', '料': 'L', '列': 'L', '劣': 'L', '烈': 'L', '猎': 'L', '裂': 'L', '林': 'L', '临': 'L', '邻': 'L', '鳞': 'L', '磷': 'L', '淋': 'L', '凛': 'L', '吝': 'L', '拎': 'L', '另': 'L', '令': 'L', '溜': 'L', '琉': 'L', '硫': 'L', '馏': 'L', '留': 'L', '刘': 'L', '流': 'L', '柳': 'L', '六': 'L', '龙': 'L', '聋': 'L', '笼': 'L', '隆': 'L', '垄': 'L', '拢': 'L', '卢': 'L', '芦': 'L', '炉': 'L', '卤': 'L', '鲁': 'L', '陆': 'L', '路': 'L', '录': 'L', '鹿': 'L', '绿': 'L', '泸': 'L', '羚': 'L',
+            '拉': 'L', '楼': 'L', '禄': 'L', '伦': 'L', '螂': 'L', '榈': 'L', '络': 'L', '洛': 'L', '菱': 'L', '霖': 'L', '力': 'L', '陵': 'L', '岭': 'L', '凌': 'L', '铝': 'L', '领': 'L', '陵': 'L', '琏': 'L', '锂': 'L', '陇': 'L', '丽': 'L', '轮': 'L', '罗': 'L', '滦': 'L', '潞': 'L', '朗': 'L', '旅': 'L', '立': 'L', '洛': 'L', '莱': 'L', '零': 'L', '来': 'L', '蜡': 'L', '利': 'L', '腊': 'L', '辣': 'L', '鹭': 'L', '蓝': 'L', '栏': 'L', '拦': 'L', '篮': 'L', '兰': 'L', '澜': 'L', '览': 'L', '揽': 'L', '缆': 'L', '烂': 'L', '滥': 'L', '琅': 'L', '郎': 'L', '狼': 'L', '廊': 'L', '浪': 'L', '捞': 'L', '劳': 'L', '牢': 'L', '老': 'L', '佬': 'L', '姥': 'L', '酪': 'L', '涝': 'L', '烙': 'L', '乐': 'L', '勒': 'L', '雷': 'L', '镭': 'L', '垒': 'L', '磊': 'L', '肋': 'L', '泪': 'L', '类': 'L', '累': 'L', '棱': 'L', '冷': 'L', '愣': 'L', '厘': 'L', '梨': 'L', '离': 'L', '莉': 'L', '理': 'L', '里': 'L', '力': 'L', '历': 'L', '沥': 'L', '联': 'L', '莲': 'L', '连': 'L', '镰': 'L', '廉': 'L', '怜': 'L', '敛': 'L', '脸': 'L', '链': 'L', '恋': 'L', '炼': 'L', '练': 'L', '粮': 'L', '凉': 'L', '梁': 'L', '良': 'L', '两': 'L', '辆': 'L', '量': 'L', '亮': 'L', '谅': 'L', '辽': 'L', '疗': 'L', '燎': 'L', '聊': 'L', '了': 'L', '料': 'L', '列': 'L', '劣': 'L', '烈': 'L', '猎': 'L', '裂': 'L', '林': 'L', '临': 'L', '邻': 'L', '鳞': 'L', '磷': 'L', '淋': 'L', '凛': 'L', '吝': 'L', '拎': 'L', '另': 'L', '令': 'L', '溜': 'L', '琉': 'L', '硫': 'L', '馏': 'L', '留': 'L', '刘': 'L', '流': 'L', '柳': 'L', '六': 'L', '龙': 'L', '聋': 'L', '笼': 'L', '隆': 'L', '垄': 'L', '拢': 'L', '卢': 'L', '芦': 'L', '炉': 'L', '卤': 'L', '鲁': 'L', '陆': 'L', '路': 'L', '录': 'L', '鹿': 'L', '绿': 'L', '泸': 'L', '羚': 'L',
             '妈': 'M', '盟': 'M', '鸣': 'M', '魅': 'M', '睦': 'M', '懋': 'M', '牧': 'M', '面': 'M', '闽': 'M', '铭': 'M', '目': 'M', '蟒': 'M', '钼': 'M', '马': 'M', '迈': 'M', '棉': 'M', '煤': 'M', '摩': 'M', '茂': 'M', '玛': 'M', '媒': 'M', '麻': 'M', '码': 'M', '骂': 'M', '埋': 'M', '买': 'M', '麦': 'M', '卖': 'M', '脉': 'M', '满': 'M', '曼': 'M', '慢': 'M', '漫': 'M', '盲': 'M', '芒': 'M', '茫': 'M', '猫': 'M', '毛': 'M', '矛': 'M', '茅': 'M', '锚': 'M', '冒': 'M', '帽': 'M', '貌': 'M', '贸': 'M', '么': 'M', '没': 'M', '枚': 'M', '梅': 'M', '美': 'M', '镁': 'M', '门': 'M', '闷': 'M', '们': 'M', '萌': 'M', '蒙': 'M', '锰': 'M', '梦': 'M', '米': 'M', '眯': 'M', '泌': 'M', '秘': 'M', '密': 'M', '幂': 'M', '蜜': 'M', '绵': 'M', '免': 'M', '勉': 'M', '冕': 'M', '缅': 'M', '苗': 'M', '描': 'M', '瞄': 'M', '秒': 'M', '渺': 'M', '妙': 'M', '庙': 'M', '灭': 'M', '蔑': 'M', '闽': 'M', '民': 'M', '敏': 'M', '明': 'M', '名': 'M', '命': 'M', '摸': 'M', '膜': 'M', '磨': 'M', '莫': 'M', '墨': 'M', '默': 'M', '模': 'M', '母': 'M', '牡': 'M', '亩': 'M', '木': 'M', '幕': 'M', '慕': 'M', '暮': 'M', '穆': 'M',
             '拿': 'N', '乃': 'N', '诺': 'N', '农': 'N', '纳': 'N', '钠': 'N', '娜': 'N', '内': 'N', '那': 'N', '南': 'N', '男': 'N', '难': 'N', '囊': 'N', '挠': 'N', '脑': 'N', '恼': 'N', '闹': 'N', '嫩': 'N', '能': 'N', '尼': 'N', '泥': 'N', '你': 'N', '拟': 'N', '逆': 'N', '溺': 'N', '年': 'N', '碾': 'N', '念': 'N', '娘': 'N', '酿': 'N', '鸟': 'N', '尿': 'N', '捏': 'N', '聂': 'N', '孽': 'N', '您': 'N', '宁': 'N', '拧': 'N', '泞': 'N', '牛': 'N', '扭': 'N', '钮': 'N', '纽': 'N', '脓': 'N', '浓': 'N', '弄': 'N', '奴': 'N', '努': 'N', '怒': 'N', '女': 'N', '暖': 'N', '虐': 'N',
             '欧': 'O', '鸥': 'O', '呕': 'O', '偶': 'O', '藕': 'O',
             '啪': 'P', '濮': 'P', '莆': 'P', '蟠': 'P', '皮': 'P', '朋': 'P', '璞': 'P', '浦': 'P', '坪': 'P', '培': 'P', '派': 'P', '普': 'P', '趴': 'P', '爬': 'P', '帕': 'P', '怕': 'P', '排': 'P', '牌': 'P', '湃': 'P', '潘': 'P', '盘': 'P', '磐': 'P', '判': 'P', '叛': 'P', '畔': 'P', '旁': 'P', '胖': 'P', '抛': 'P', '袍': 'P', '跑': 'P', '泡': 'P', '配': 'P', '沛': 'P', '喷': 'P', '盆': 'P', '砰': 'P', '抨': 'P', '烹': 'P', '彭': 'P', '蓬': 'P', '棚': 'P', '硼': 'P', '鹏': 'P', '碰': 'P', '批': 'P', '披': 'P', '劈': 'P', '毗': 'P', '匹': 'P', '痞': 'P', '屁': 'P', '僻': 'P', '片': 'P', '偏': 'P', '篇': 'P', '骗': 'P', '票': 'P', '漂': 'P', '飘': 'P', '瓢': 'P', '撇': 'P', '拼': 'P', '贫': 'P', '频': 'P', '品': 'P', '聘': 'P', '平': 'P', '评': 'P', '凭': 'P', '瓶': 'P', '萍': 'P',
-            '七': 'Q', '颀': 'Q', '碁': 'Q', '秋': 'Q', '衢': 'Q', '乾': 'Q', '群': 'Q', '奇': 'Q', '期': 'Q', '欺': 'Q', '栖': 'Q', '戚': 'Q', '齐': 'Q', '旗': 'Q', '其': 'Q', '棋': 'Q', '祈': 'Q', '歧': 'Q', '崎': 'Q', '脐': 'Q', '骑': 'Q', '起': 'Q', '岂': 'Q', '企': 'Q', '启': 'Q', '气': 'Q', '弃': 'Q', '汽': 'Q', '器': 'Q', '掐': 'Q', '恰': 'Q', '洽': 'Q', '千': 'Q', '迁': 'Q', '签': 'Q', '牵': 'Q', '扦': 'Q', '钎': 'Q', '铅': 'Q', '钱': 'Q', '钳': 'Q', '潜': 'Q', '浅': 'Q', '遣': 'Q', '欠': 'Q', '歉': 'Q', '枪': 'Q', '呛': 'Q', '腔': 'Q', '羌': 'Q', '墙': 'Q', '蔷': 'Q', '强': 'Q', '抢': 'Q', '桥': 'Q', '乔': 'Q', '侨': 'Q', '巧': 'Q', '翘': 'Q', '峭': 'Q', '俏': 'Q', '窍': 'Q', '切': 'Q', '茄': 'Q', '且': 'Q', '怯': 'Q', '钦': 'Q', '侵': 'Q', '秦': 'Q', '琴': 'Q', '勤': 'Q', '芹': 'Q', '擒': 'Q', '寝': 'Q', '青': 'Q', '轻': 'Q', '氢': 'Q', '倾': 'Q', '卿': 'Q', '清': 'Q', '情': 'Q', '晴': 'Q', '擎': 'Q', '请': 'Q', '庆': 'Q', '穷': 'Q', '琼': 'Q', '求': 'Q', '球': 'Q', '囚': 'Q', '酋': 'Q', '趋': 'Q', '区': 'Q', '曲': 'Q', '躯': 'Q', '屈': 'Q', '驱': 'Q', '渠': 'Q', '取': 'Q', '娶': 'Q', '去': 'Q', '圈': 'Q', '全': 'Q', '泉': 'Q', '权': 'Q', '拳': 'Q', '犬': 'Q', '劝': 'Q', '券': 'Q',
+            '七': 'Q', '麒': 'Q', '趣': 'Q', '颀': 'Q', '碁': 'Q', '秋': 'Q', '衢': 'Q', '乾': 'Q', '群': 'Q', '奇': 'Q', '期': 'Q', '欺': 'Q', '栖': 'Q', '戚': 'Q', '齐': 'Q', '旗': 'Q', '其': 'Q', '棋': 'Q', '祈': 'Q', '歧': 'Q', '崎': 'Q', '脐': 'Q', '骑': 'Q', '起': 'Q', '岂': 'Q', '企': 'Q', '启': 'Q', '气': 'Q', '弃': 'Q', '汽': 'Q', '器': 'Q', '掐': 'Q', '恰': 'Q', '洽': 'Q', '千': 'Q', '迁': 'Q', '签': 'Q', '牵': 'Q', '扦': 'Q', '钎': 'Q', '铅': 'Q', '钱': 'Q', '钳': 'Q', '潜': 'Q', '浅': 'Q', '遣': 'Q', '欠': 'Q', '歉': 'Q', '枪': 'Q', '呛': 'Q', '腔': 'Q', '羌': 'Q', '墙': 'Q', '蔷': 'Q', '强': 'Q', '抢': 'Q', '桥': 'Q', '乔': 'Q', '侨': 'Q', '巧': 'Q', '翘': 'Q', '峭': 'Q', '俏': 'Q', '窍': 'Q', '切': 'Q', '茄': 'Q', '且': 'Q', '怯': 'Q', '钦': 'Q', '侵': 'Q', '秦': 'Q', '琴': 'Q', '勤': 'Q', '芹': 'Q', '擒': 'Q', '寝': 'Q', '青': 'Q', '轻': 'Q', '氢': 'Q', '倾': 'Q', '卿': 'Q', '清': 'Q', '情': 'Q', '晴': 'Q', '擎': 'Q', '请': 'Q', '庆': 'Q', '穷': 'Q', '琼': 'Q', '求': 'Q', '球': 'Q', '囚': 'Q', '酋': 'Q', '趋': 'Q', '区': 'Q', '曲': 'Q', '躯': 'Q', '屈': 'Q', '驱': 'Q', '渠': 'Q', '取': 'Q', '娶': 'Q', '去': 'Q', '圈': 'Q', '全': 'Q', '泉': 'Q', '权': 'Q', '拳': 'Q', '犬': 'Q', '劝': 'Q', '券': 'Q',
             '然': 'R', '冉': 'R', '戎': 'R', '嵘': 'R', '融': 'R', '燃': 'R', '睿': 'R', '染': 'R', '壤': 'R', '让': 'R', '饶': 'R', '扰': 'R', '绕': 'R', '热': 'R', '人': 'R', '仁': 'R', '忍': 'R', '韧': 'R', '任': 'R', '认': 'R', '刃': 'R', '扔': 'R', '仍': 'R', '日': 'R', '荣': 'R', '茸': 'R', '蓉': 'R', '熔': 'R', '溶': 'R', '容': 'R', '绒': 'R', '冗': 'R', '揉': 'R', '柔': 'R', '肉': 'R', '如': 'R', '辱': 'R', '乳': 'R', '入': 'R', '软': 'R', '蕊': 'R', '瑞': 'R', '锐': 'R', '闰': 'R', '润': 'R', '若': 'R', '弱': 'R',
             '撒': 'S', '属': 'S', '厦': 'S', '饲': 'S', '仕': 'S', '蔬': 'S', '莎': 'S', '饰': 'S', '思': 'S', '是': 'S', '实': 'S', '绅': 'S', '昇': 'S', '晟': 'S', '杉': 'S', '设': 'S', '崧': 'S', '洒': 'S', '萨': 'S', '斯': 'S', '山': 'S', '塞': 'S', '赛': 'S', '三': 'S', '伞': 'S', '散': 'S', '桑': 'S', '丧': 'S', '扫': 'S', '嫂': 'S', '色': 'S', '涩': 'S', '森': 'S', '僧': 'S', '杀': 'S', '沙': 'S', '纱': 'S', '刹': 'S', '砂': 'S', '晒': 'S', '删': 'S', '煽': 'S', '衫': 'S', '闪': 'S', '陕': 'S', '擅': 'S', '膳': 'S', '善': 'S', '汕': 'S', '扇': 'S', '伤': 'S', '商': 'S', '赏': 'S', '上': 'S', '尚': 'S', '梢': 'S', '捎': 'S', '烧': 'S', '勺': 'S', '芍': 'S', '少': 'S', '韶': 'S', '邵': 'S', '哨': 'S', '绍': 'S', '奢': 'S', '蛇': 'S', '舌': 'S', '舍': 'S', '赦': 'S', '摄': 'S', '射': 'S', '申': 'S', '伸': 'S', '身': 'S', '深': 'S', '神': 'S', '沈': 'S', '审': 'S', '婶': 'S', '甚': 'S', '渗': 'S', '慎': 'S', '声': 'S', '生': 'S', '牲': 'S', '升': 'S', '绳': 'S', '省': 'S', '盛': 'S', '剩': 'S', '胜': 'S', '圣': 'S', '失': 'S', '狮': 'S', '施': 'S', '湿': 'S', '诗': 'S', '尸': 'S', '十': 'S', '石': 'S', '拾': 'S', '时': 'S', '什': 'S', '食': 'S', '蚀': 'S', '实': 'S', '识': 'S', '史': 'S', '矢': 'S', '使': 'S', '始': 'S', '驶': 'S', '士': 'S', '氏': 'S', '世': 'S', '市': 'S', '柿': 'S', '示': 'S', '式': 'S', '事': 'S', '侍': 'S', '释': 'S', '世': 'S', '市': 'S', '室': 'S', '视': 'S', '试': 'S', '收': 'S', '手': 'S', '首': 'S', '守': 'S', '寿': 'S', '受': 'S', '授': 'S', '售': 'S', '瘦': 'S', '书': 'S', '抒': 'S', '枢': 'S', '殊': 'S', '叔': 'S', '疏': 'S', '舒': 'S', '输': 'S', '蔬': 'S', '孰': 'S', '赎': 'S', '熟': 'S', '薯': 'S', '暑': 'S', '曙': 'S', '署': 'S', '蜀': 'S', '鼠': 'S', '数': 'S', '术': 'S', '束': 'S', '树': 'S', '竖': 'S', '恕': 'S', '庶': 'S', '刷': 'S', '耍': 'S', '衰': 'S', '摔': 'S', '甩': 'S', '帅': 'S', '栓': 'S', '双': 'S', '霜': 'S', '爽': 'S', '谁': 'S', '水': 'S', '税': 'S', '睡': 'S', '顺': 'S', '舜': 'S', '瞬': 'S', '说': 'S', '朔': 'S', '烁': 'S', '硕': 'S', '司': 'S', '丝': 'S', '死': 'S', '肆': 'S', '寺': 'S', '四': 'S', '伺': 'S', '似': 'S', '松': 'S', '耸': 'S', '送': 'S', '宋': 'S', '颂': 'S', '讼': 'S', '搜': 'S', '艘': 'S', '擞': 'S', '嗽': 'S', '苏': 'S', '酥': 'S', '俗': 'S', '素': 'S', '速': 'S', '粟': 'S', '塑': 'S', '溯': 'S', '宿': 'S', '诉': 'S', '肃': 'S', '酸': 'S', '蒜': 'S', '算': 'S', '虽': 'S', '隋': 'S', '随': 'S', '绥': 'S', '碎': 'S', '穗': 'S', '隧': 'S', '孙': 'S', '损': 'S', '笋': 'S', '梭': 'S', '唆': 'S', '缩': 'S', '所': 'S', '琐': 'S', '索': 'S', '锁': 'S',
             '他': 'T', '梯': 'T', '拓': 'T', '螳': 'T', '腿': 'T', '同': 'T', '韬': 'T', '台': 'T', '钛': 'T', '坦': 'T', '庭': 'T', '潭': 'T', '拓': 'T', '她': 'T', '它': 'T', '塔': 'T', '獭': 'T', '钽': 'T', '挞': 'T', '踏': 'T', '胎': 'T', '苔': 'T', '抬': 'T', '太': 'T', '态': 'T', '泰': 'T', '坍': 'T', '摊': 'T', '贪': 'T', '瘫': 'T', '坛': 'T', '谈': 'T', '痰': 'T', '谭': 'T', '碳': 'T', '探': 'T', '汤': 'T', '唐': 'T', '糖': 'T', '塘': 'T', '躺': 'T', '堂': 'T', '棠': 'T', '汤': 'T', '滔': 'T', '涛': 'T', '桃': 'T', '逃': 'T', '淘': 'T', '陶': 'T', '讨': 'T', '套': 'T', '特': 'T', '疼': 'T', '腾': 'T', '藤': 'T', '剔': 'T', '踢': 'T', '提': 'T', '题': 'T', '蹄': 'T', '体': 'T', '替': 'T', '涕': 'T', '剃': 'T', '天': 'T', '添': 'T', '填': 'T', '田': 'T', '甜': 'T', '恬': 'T', '腆': 'T', '挑': 'T', '条': 'T', '迢': 'T', '跳': 'T', '贴': 'T', '铁': 'T', '厅': 'T', '听': 'T', '烃': 'T', '停': 'T', '庭': 'T', '亭': 'T', '通': 'T', '桐': 'T', '铜': 'T', '童': 'T', '桶': 'T', '筒': 'T', '统': 'T', '痛': 'T', '偷': 'T', '头': 'T', '投': 'T', '透': 'T', '突': 'T', '图': 'T', '徒': 'T', '途': 'T', '涂': 'T', '土': 'T', '吐': 'T', '兔': 'T', '湍': 'T', '团': 'T', '推': 'T', '颓': 'T', '退': 'T', '蜕': 'T', '褪': 'T', '吞': 'T', '屯': 'T', '臀': 'T', '拖': 'T', '托': 'T', '脱': 'T', '陀': 'T', '驮': 'T', '驼': 'T', '椭': 'T',
@@ -12039,6 +12135,19 @@ function renderFirstLimits(firstLimits, isTrading = false, enableSort = true) {
              const isSingleColumn = sortedStocks.length <= 4;
              const uniqueId = `topic-card-menu-${topicId}`;
 
+             // 渲染单个标的卡片（根据模式显示不同内容）
+             const renderStockCard = (stock) => {
+                 let changeContent = '';
+                 if (premiumMode) {
+                     const premium = getPremiumByCode(stock.code);
+                     const cp = premium ? premium.change_percent : null;
+                     changeContent = `<div class="topic-stock-change" style="${getChangePercentStyle(cp)}">${formatChangePercent(cp)}</div>`;
+                 } else {
+                     changeContent = `<div class="topic-stock-change" style="color: #ff4757;">+${stock.change_percent}%</div>`;
+                 }
+                 return `<div class="topic-stock-card"><span class="topic-stock-remove" onclick="removeFromTopic(event, '${topicName}', '${stock.code}', ${topicId})">×</span><div class="topic-stock-name">${stock.name}</div>${changeContent}<div class="topic-stock-time">${stock.first_time}</div></div>`;
+             };
+
              if (isSingleColumn) {
                  // 单列题材：下拉菜单按钮
                  return `
@@ -12075,7 +12184,7 @@ function renderFirstLimits(firstLimits, isTrading = false, enableSort = true) {
                                 ${sortedStocks.length === 0
                        ? '<div class="topic-placeholder">拖入首板标的</div>'
                        : '<div class="topic-stocks-grid" style="grid-template-columns: repeat(' + columns + ', 1fr);">' +
-                       sortedStocks.map(stock => '<div class="topic-stock-card"><span class="topic-stock-remove" onclick="removeFromTopic(event, \'' + topicName + '\', \'' + stock.code + '\', ' + topicId + ')">×</span><div class="topic-stock-name">' + stock.name + '</div><div class="topic-stock-change">+' + stock.change_percent + '%</div><div class="topic-stock-time">' + stock.first_time + '</div></div>').join('') +
+                       sortedStocks.map(stock => renderStockCard(stock)).join('') +
                        '</div>'
                    }
                             </div>
@@ -12113,7 +12222,7 @@ function renderFirstLimits(firstLimits, isTrading = false, enableSort = true) {
                                 ${sortedStocks.length === 0
                        ? '<div class="topic-placeholder">拖入首板标的</div>'
                        : '<div class="topic-stocks-grid" style="grid-template-columns: repeat(' + columns + ', 1fr);">' +
-                       sortedStocks.map(stock => '<div class="topic-stock-card"><span class="topic-stock-remove" onclick="removeFromTopic(event, \'' + topicName + '\', \'' + stock.code + '\', ' + topicId + ')">×</span><div class="topic-stock-name">' + stock.name + '</div><div class="topic-stock-change">+' + stock.change_percent + '%</div><div class="topic-stock-time">' + stock.first_time + '</div></div>').join('') +
+                       sortedStocks.map(stock => renderStockCard(stock)).join('') +
                        '</div>'
                    }
                             </div>
@@ -12136,6 +12245,159 @@ async function toggleTopicHeightSort() {
     localStorage.setItem('enableTopicHeightSort', enableTopicHeightSort);
     // 刷新今日首板板块以应用新的排序，根据排序开关状态决定是否排序
     await refreshTodayFirstLimits(enableTopicHeightSort);
+}
+
+// ========== 溢价模式相关函数 ==========
+
+// 切换溢价模式
+// 重新渲染今日首板板块（使用缓存数据，用于溢价模式切换时刷新显示）
+function renderTodayFirstLimits() {
+    console.log('[renderTodayFirstLimits] 开始', {
+        premiumMode,
+        todayFirstLimitsDataLen: todayFirstLimitsData.length,
+        todayFirstLimitsIsTrading,
+        premiumsLen: premiums.length,
+        todayTopicsLen: todayTopics.length
+    });
+    if (todayFirstLimitsData.length === 0) {
+        console.warn('[renderTodayFirstLimits] 无缓存首板数据');
+        return;
+    }
+    const html = renderFirstLimits(todayFirstLimitsData, todayFirstLimitsIsTrading, false);
+    // 用稳定的 data-attribute 匹配目标 card，避免 ID 选择器在 DOM 替换后失效
+    const targetCard = document.querySelector('.card[data-card-type="today-first-limits"]');
+    if (!targetCard) {
+        console.warn('[renderTodayFirstLimits] 未找到目标 card（.card[data-card-type="today-first-limits"]）');
+        return;
+    }
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = html;
+    const newCard = tempDiv.firstElementChild;
+    if (!newCard) {
+        console.warn('[renderTodayFirstLimits] html 解析失败，firstElementChild 为空');
+        return;
+    }
+    // 整 card 替换（外层保留），保留所有事件监听器和子节点上的 inline 事件
+    targetCard.replaceChildren(...newCard.childNodes);
+    console.log('[renderTodayFirstLimits] 已替换 card 内容，新标题：',
+        targetCard.querySelector('#firstLimitsTitle')?.textContent);
+}
+
+async function togglePremiumMode() {
+    console.log('[togglePremiumMode] 进入');
+    const checkbox = document.getElementById('premiumModeToggle');
+    const newMode = checkbox.checked;
+    // 避免重复触发（onchange 已设过，重复调用会再次覆盖）
+    if (newMode === premiumMode) {
+        console.log('[togglePremiumMode] 模式未变化，跳过');
+        return;
+    }
+    premiumMode = newMode;
+
+    // 更新标签文本
+    const label = document.getElementById('premiumModeLabel');
+    if (label) {
+        label.textContent = premiumMode ? '今日首板' : '昨日溢价';
+    }
+
+    console.log(`[溢价模式] 切换到: ${premiumMode ? '昨日溢价' : '今日首板'}`);
+
+    if (premiumMode) {
+        // 进入溢价模式：保存当前"今日"数据，临时替换为"昨日"数据
+        savedTodayFirstLimitsData = todayFirstLimitsData;
+        savedTodayTopics = todayTopics;
+        console.log('[togglePremiumMode] 已保存今日数据，准备拉取昨日数据', {
+            savedFirstLimits: savedTodayFirstLimitsData.length,
+            savedTopics: savedTodayTopics.length
+        });
+        // 1) 拉溢价快照（这里 premiumLimitDate 就是前一交易日）
+        await fetchPremiumData();
+        const yesterday = premiumLimitDate;
+        if (!yesterday) {
+            console.warn('[togglePremiumMode] premiumLimitDate 为空，无法拉昨日数据');
+            renderTodayFirstLimits();
+            return;
+        }
+        // 2) 拉昨日的 first_limits + today_topics（等价于把日期切到昨天）
+        try {
+            const response = await fetch(`/api/dashboard?queryDate=${yesterday}`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            todayFirstLimitsData = data.first_limits || [];
+            todayTopics = data.today_topics || [];
+            console.log('[togglePremiumMode] 昨日数据已替换', {
+                firstLimits: todayFirstLimitsData.length,
+                topics: todayTopics.length
+            });
+        } catch (err) {
+            console.error('[togglePremiumMode] 拉昨日数据失败:', err);
+        }
+    } else {
+        // 退出溢价模式：恢复"今日"数据
+        if (savedTodayFirstLimitsData) todayFirstLimitsData = savedTodayFirstLimitsData;
+        if (savedTodayTopics) todayTopics = savedTodayTopics;
+        savedTodayFirstLimitsData = null;
+        savedTodayTopics = null;
+        console.log('[togglePremiumMode] 已恢复今日数据', {
+            firstLimits: todayFirstLimitsData.length,
+            topics: todayTopics.length
+        });
+    }
+
+    // 重新渲染今日首板
+    renderTodayFirstLimits();
+}
+
+// 获取溢价数据
+async function fetchPremiumData() {
+    try {
+        const date = currentQueryDate || displayTradeDate;
+        if (!date) {
+            console.warn('[溢价模式] 无日期，跳过获取');
+            return;
+        }
+        
+        console.log(`[溢价模式] 获取溢价数据，日期: ${date}`);
+        const response = await fetch(`/api/first-limit-premiums/${date}`);
+        const data = await response.json();
+        
+        premiums = data.premiums || [];
+        premiumLimitDate = data.limit_date || '';
+        
+        console.log(`[溢价模式] 获取到 ${premiums.length} 条溢价数据，首板日期: ${premiumLimitDate}`);
+    } catch (error) {
+        console.error('[溢价模式] 获取溢价数据失败:', error);
+        premiums = [];
+        premiumLimitDate = '';
+    }
+}
+
+// 根据股票代码获取溢价数据
+function getPremiumByCode(code) {
+    if (!premiumMode || !premiums.length) return null;
+    return premiums.find(p => p.code === code) || null;
+}
+
+// 获取涨跌幅颜色样式
+function getChangePercentStyle(changePercent) {
+    if (changePercent === null || changePercent === undefined) {
+        return 'color: #888;'; // 灰色（无数据）
+    }
+    if (changePercent > 0) {
+        return 'color: #ff4757;'; // 红色（涨）
+    } else if (changePercent < 0) {
+        return 'color: #2ed573;'; // 绿色（跌）
+    }
+    return 'color: #888;'; // 灰色（平）
+}
+
+// 格式化涨跌幅显示
+function formatChangePercent(changePercent) {
+    if (changePercent === null || changePercent === undefined) {
+        return '--';
+    }
+    const prefix = changePercent > 0 ? '+' : '';
+    return `${prefix}${changePercent.toFixed(2)}%`;
 }
 
          // 打开今日首板题材弹窗
