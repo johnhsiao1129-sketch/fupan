@@ -571,7 +571,32 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_daily_data_date ON stock_daily_data(trade_date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_stock_daily_data_stock ON stock_daily_data(stock_id)')
 
-    # 21. 盘中记录表（手动记录盘面信息，每条带 HH:MM 时间标签）
+    # 22. 首板溢价快照表（存储首板标的在后续交易日的涨跌幅）
+    # 业务规则：
+    # - premium_date: 溢价快照日期（观察日）
+    # - limit_date: 首板日期
+    # - change_percent: 该标的在premium_date的涨跌幅
+    # - 唯一约束: 同一股票在同一观察日对同一首板日只能有一条记录
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS first_limit_premiums (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id INTEGER NOT NULL,
+            premium_date TEXT NOT NULL,
+            limit_date TEXT NOT NULL,
+            change_percent REAL,
+            snapshot_time TEXT,
+            create_time TEXT NOT NULL,
+            UNIQUE(stock_id, limit_date, premium_date),
+            FOREIGN KEY (stock_id) REFERENCES stocks(stock_id) ON DELETE CASCADE
+        )
+    ''')
+
+    # first_limit_premiums 表索引
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_premiums_limit_date ON first_limit_premiums(limit_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_premiums_premium_date ON first_limit_premiums(premium_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_premiums_stock_limit ON first_limit_premiums(stock_id, limit_date)')
+
+    # 23. 盘中记录表（手动记录盘面信息，每条带 HH:MM 时间标签）
     # 业务规则：
     # - trade_date + note_time 唯一：同一时间同一日期只一条
     # - content 多段落用 \n\n 分隔

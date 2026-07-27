@@ -3810,3 +3810,141 @@ class RotationAnalysisDB:
         except Exception as e:
             logger.error(f"自动创建题材卡片失败: {e}", exc_info=True)
             return []
+
+    # ========== 首板溢价快照相关方法 ==========
+
+    def get_first_limit_premiums(self, limit_date: str, premium_date: str) -> List[Dict]:
+        """获取首板溢价数据
+
+        Args:
+            limit_date: 首板日期（YYYY-MM-DD）
+            premium_date: 溢价快照日期（YYYY-MM-DD）
+
+        Returns:
+            溢价数据列表
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT flp.stock_id, s.stock_code, s.stock_name, flp.change_percent
+                FROM first_limit_premiums flp
+                JOIN stocks s ON flp.stock_id = s.stock_id
+                WHERE flp.limit_date = ? AND flp.premium_date = ?
+            ''', (limit_date, premium_date))
+
+            records = []
+            for row in cursor.fetchall():
+                records.append({
+                    'stock_id': row[0],
+                    'code': row[1],
+                    'name': row[2],
+                    'change_percent': row[3]
+                })
+
+            conn.close()
+            return records
+        except Exception as e:
+            logger.error(f"获取首板溢价数据失败: {e}")
+            return []
+
+    def save_first_limit_premium(self, stock_id: int, limit_date: str, premium_date: str, change_percent: float) -> bool:
+        """保存单条首板溢价快照
+
+        Args:
+            stock_id: 股票ID
+            limit_date: 首板日期（YYYY-MM-DD）
+            premium_date: 溢价快照日期（YYYY-MM-DD）
+            change_percent: 涨跌幅
+
+        Returns:
+            是否保存成功
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # 使用 INSERT OR REPLACE 处理重复
+            cursor.execute('''
+                INSERT OR REPLACE INTO first_limit_premiums
+                (stock_id, limit_date, premium_date, change_percent, snapshot_time, create_time)
+                VALUES (?, ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))
+            ''', (stock_id, limit_date, premium_date, change_percent))
+
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"保存首板溢价快照失败: {e}")
+            return False
+
+    def save_first_limit_premiums_batch(self, premiums_data: List[Dict]) -> int:
+        """批量保存首板溢价快照
+
+        Args:
+            premiums_data: 溢价数据列表，每个元素包含:
+                - stock_id: 股票ID
+                - limit_date: 首板日期
+                - premium_date: 溢价快照日期
+                - change_percent: 涨跌幅
+
+        Returns:
+            成功保存的数量
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            saved_count = 0
+
+            for item in premiums_data:
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO first_limit_premiums
+                        (stock_id, limit_date, premium_date, change_percent, snapshot_time, create_time)
+                        VALUES (?, ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))
+                    ''', (
+                        item['stock_id'],
+                        item['limit_date'],
+                        item['premium_date'],
+                        item['change_percent']
+                    ))
+                    saved_count += 1
+                except Exception as e:
+                    logger.warning(f"保存单条溢价数据失败: {e}")
+
+            conn.commit()
+            conn.close()
+
+            logger.info(f"批量保存溢价快照完成：{saved_count}/{len(premiums_data)}")
+            return saved_count
+        except Exception as e:
+            logger.error(f"批量保存溢价快照失败: {e}")
+            return 0
+
+    def has_first_limit_premiums(self, limit_date: str, premium_date: str) -> bool:
+        """检查指定首板日和溢价日的快照是否已存在
+
+        Args:
+            limit_date: 首板日期
+            premium_date: 溢价快照日期
+
+        Returns:
+            是否存在
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT COUNT(*) FROM first_limit_premiums
+                WHERE limit_date = ? AND premium_date = ?
+            ''', (limit_date, premium_date))
+
+            count = cursor.fetchone()[0]
+            conn.close()
+
+            return count > 0
+        except Exception as e:
+            logger.error(f"检查溢价快照是否存在失败: {e}")
+            return False
