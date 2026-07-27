@@ -1345,6 +1345,69 @@ class StockDataService:
             logger.error(f"获取标的热度板块数据失败: {e}", exc_info=True)
             return {"success": False, "message": str(e), "trade_date": trade_date, "popularity_sources": [], "popularity_data": [], "amount_types": [], "amount_data": []}
 
+
+async def fetch_previous_em_data(query_date: str) -> List[Dict]:
+    """通过 stock_zt_pool_previous_em(date=今天) 拉取【昨涨停今表现】数据
+
+    返回结构与 fetch_spot_data 兼容: [{code, name, change_percent}, ...]
+    覆盖范围: 昨天所有涨停的票（包含昨天首板 + 昨天连板），不覆盖非涨停的首板（极少数）。
+
+    为何不用 stock_zh_a_spot_em()：东财 push2 全市场接口当前环境被 IP 限频，
+    用户曾因此被封禁 1 个月。本接口走的限频更宽松，0.2s 单次返回 100+ 条。
+
+    【重要：2026-07-24 经验沉淀】
+    1. 东财封禁黑名单 (本机环境已不可用):
+       - ak.stock_zh_a_spot_em() — 全市场行情 (用户被封 1 个月, **禁用**)
+       - ak.stock_zh_a_hist()    — 单股 K 线 (同上, **禁用**)
+       - ak.stock_bid_ask_em()   — 实时盘口 (同上, **禁用**)
+    2. 东财仍可用接口 (限频宽松):
+       - ak.stock_zt_pool_previous_em(date=今天) — **核心**, 0.2s/100+ 条
+       - ak.stock_zt_pool_em(date=今天)         — 当日涨停池, 0.2s/40 条
+       - ak.stock_zt_pool_strong_em(date=今天)  — 强势股池, 0.4s/56 条
+    3. 任何东财接口调用前必须:
+       - 加 2s 限速 (time.sleep 2)
+       - 加 try/except fallback
+       - 最多 2 次重试 (首调 + 1 次)
+    4. 全局数据源优先级: limit_pool → previous_em → fetch_spot_data (最后)
+    """
+    try:
+        import akshare as ak
+        import math as _math
+        date_compact = query_date.replace("-", "")
+
+        def _call():
+            return ak.stock_zt_pool_previous_em(date=date_compact)
+
+        df = await asyncio.to_thread(_call)
+        if df is None or len(df) == 0:
+            logger.warning(f"stock_zt_pool_previous_em({date_compact}) 返回空")
+            return []
+
+        results = []
+        for _, row in df.iterrows():
+            try:
+                code = str(row.get("代码", "")).zfill(6)
+                pct_raw = row.get("涨跌幅")
+                if pct_raw is None:
+                    continue
+                if isinstance(pct_raw, float) and _math.isnan(pct_raw):
+                    continue
+                results.append({
+                    "code": code,
+                    "name": str(row.get("名称", "")),
+                    "change_percent": float(pct_raw),
+                })
+            except Exception as e:
+                logger.debug(f"解析 previous_em 行失败: {e}")
+                continue
+
+        logger.info(f"fetch_previous_em_data({date_compact}) → {len(results)} 条")
+        return results
+    except Exception as e:
+        logger.error(f"fetch_previous_em_data 失败: {e}")
+        return []
+
+
 @app.get("/api/limit-stats")
 async def get_limit_statistics(query_date: str = None):
     data = await StockDataService().get_limit_stats(query_date)
@@ -1527,6 +1590,54 @@ async def refresh_limit_statistics(
             "refresh_today_first_limits": True  # 联动刷新今日首板板块
         }
 
+        # ===== 盘后保存溢价快照 =====
+        # 如果query_date是某个交易日，则保存该日首板标的在query_date的涨跌幅
+        # 直接复用 fetch_and_save_limit_data 返回的当日涨停池 limit_pool，
+        # 避免再次调用不稳定的 ak.stock_zh_a_spot_em()
+        premium_limit_date = db.get_previous_trading_day(query_date)
+        premium_saved_count = 0
+        if premium_limit_date:
+            logger.info(f"[盘后刷新] 保存溢价快照：首板日期 {premium_limit_date}，快照日期 {query_date}")
+            try:
+                # 获取上一交易日的首板标的
+                premium_limit_stocks = db.get_first_limits_by_date(premium_limit_date, table="first_limits")
+                if premium_limit_stocks:
+                    # 数据源优先级: limit_pool (今日涨停池) → previous_em (昨涨停今表现) → fetch_spot_data (全市场, 易被封)
+                    spot_data = raw_result.get("limit_pool", []) if raw_result else []
+                    if not spot_data:
+                        # 降级：用 stock_zt_pool_previous_em 拉"昨涨停今表现"
+                        logger.warning("[盘后刷新] 涨停池为空，降级尝试 stock_zt_pool_previous_em")
+                        spot_data = await fetch_previous_em_data(query_date)
+                        if not spot_data:
+                            # 终极降级：尝试 fetch_spot_data（非交易时段可能失败, 易被东财限频）
+                            logger.warning("[盘后刷新] previous_em 仍空，最终降级 fetch_spot_data")
+                            spot_data = await service.fetch_spot_data()
+                    # 构建溢价数据
+                    premiums_data = []
+                    for stock in premium_limit_stocks:
+                        stock_id = stock.get("stock_id")
+                        stock_code = stock.get("code", "")
+                        change_percent = None
+                        for spot in spot_data:
+                            if spot.get("code") == stock_code:
+                                change_percent = spot.get("change_percent")
+                                break
+                        if stock_id and change_percent is not None:
+                            premiums_data.append({
+                                "stock_id": stock_id,
+                                "limit_date": premium_limit_date,
+                                "premium_date": query_date,
+                                "change_percent": change_percent
+                            })
+                    # 批量保存
+                    premium_saved_count = db.save_first_limit_premiums_batch(premiums_data)
+                    logger.info(f"[盘后刷新] 溢价快照保存完成：{premium_saved_count} 条")
+            except Exception as e:
+                logger.error(f"[盘后刷新] 保存溢价快照失败: {e}", exc_info=True)
+
+        result["premium_saved_count"] = premium_saved_count
+        result["premium_limit_date"] = premium_limit_date
+
         return result
     except Exception as e:
         logger.error(f"手动刷新涨停数据失败: {e}", exc_info=True)
@@ -1581,6 +1692,51 @@ async def refresh_intraday_data(targetDate: str = Body(..., embed=True, descript
 
         logger.info(f"盘中刷新 激活题材: {len(activated_topics)} 个")
 
+        # ===== 获取溢价数据（盘中实时获取） =====
+        premiums = []
+        limit_date = db.get_previous_trading_day(query_date)
+        if limit_date:
+            logger.info(f"获取溢价数据：首板日期 {limit_date}，快照日期 {query_date}")
+            # 获取上一交易日的首板标的
+            limit_stocks = db.get_first_limits_by_date(limit_date, table="first_limits")
+            if limit_stocks:
+                # 数据源优先级: previous_em (昨涨停今表现) → fetch_spot_data (全市场, 易被封)
+                spot_data = await fetch_previous_em_data(query_date)
+                if not spot_data:
+                    # 降级：尝试 fetch_spot_data（非交易时段可能失败, 易被东财限频）
+                    logger.warning("[盘中刷新] previous_em 为空，降级 fetch_spot_data")
+                    spot_data = await service.fetch_spot_data()
+                # 匹配涨跌幅
+                for stock in limit_stocks:
+                    stock_code = stock.get("code", "")
+                    change_percent = None
+                    for spot in spot_data:
+                        if spot.get("code") == stock_code:
+                            change_percent = spot.get("change_percent")
+                            break
+                    premiums.append({
+                        "stock_id": stock.get("stock_id"),
+                        "code": stock_code,
+                        "name": stock.get("name"),
+                        "change_percent": change_percent
+                    })
+                # 落库正式表（盘中数据, 盘后刷新会覆盖）
+                try:
+                    premiums_for_db = [
+                        {
+                            "stock_id": p["stock_id"],
+                            "limit_date": limit_date,
+                            "premium_date": query_date,
+                            "change_percent": p["change_percent"],
+                        }
+                        for p in premiums
+                    ]
+                    saved = db.save_first_limit_premiums_batch(premiums_for_db)
+                    logger.info(f"盘中溢价快照已落库: {saved}/{len(premiums_for_db)}")
+                except Exception as e:
+                    logger.warning(f"盘中溢价快照落库失败: {e}")
+            logger.info(f"获取到 {len(premiums)} 条溢价数据")
+
         result = {
             "success": raw_result.get("success", False) or (raw_result.get("first_limit_count", 0) > 0),
             "message": raw_result.get("message", ""),
@@ -1594,7 +1750,9 @@ async def refresh_intraday_data(targetDate: str = Body(..., embed=True, descript
             "using_tmp_table": True,  # 使用临时表
             "auto_created_topics": True,
             "activated_topics": activated_topics,
-            "activated_topics_count": len(activated_topics)
+            "activated_topics_count": len(activated_topics),
+            "premiums": premiums,
+            "premium_limit_date": limit_date
         }
 
         return result
@@ -1602,6 +1760,240 @@ async def refresh_intraday_data(targetDate: str = Body(..., embed=True, descript
         raise
     except Exception as e:
         logger.error(f"盘中刷新今日首板数据失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/first-limit-premiums/{date}")
+async def get_first_limit_premiums(date: str):
+    """获取首板溢价数据
+
+    业务逻辑：
+    - 计算指定日期的上一个交易日
+    - 如果date是今天且在盘中 → 实时获取涨跌幅
+    - 其他情况 → 从数据库读取溢价快照
+    - 返回该交易日所有首板标的在date的涨跌幅
+
+    Args:
+        date: 当前显示的日期（格式：YYYY-MM-DD），即溢价快照日期
+    """
+    try:
+        logger.info(f"获取首板溢价数据，快照日期：{date}")
+
+        # 获取上一个交易日（首板日期）
+        limit_date = db.get_previous_trading_day(date)
+        if not limit_date:
+            logger.warning(f"无法获取 {date} 的上一个交易日")
+            return {"premiums": [], "limit_date": None, "snapshot_date": date}
+
+        logger.info(f"首板日期：{limit_date}，快照日期：{date}")
+
+        # 判断是否是今天且在盘中 → 实时获取
+        today_str = get_query_trading_date()
+        is_today = (date == today_str)
+        in_trading = is_in_trading_hours()
+
+        if is_today and in_trading:
+            # 盘中实时获取
+            logger.info("盘中实时获取溢价数据")
+            from src.data_acquisition import DataAcquisitionService
+            service = DataAcquisitionService()
+
+            # 获取上一交易日的首板标的
+            limit_stocks = db.get_first_limits_by_date(limit_date, table="first_limits")
+            if not limit_stocks:
+                logger.info(f"上一交易日 {limit_date} 无首板标的")
+                return {"premiums": [], "limit_date": limit_date, "snapshot_date": date}
+
+            # 数据源优先级: previous_em (昨涨停今表现) → fetch_spot_data (全市场, 易被封)
+            spot_data = await fetch_previous_em_data(date)
+            if not spot_data:
+                # 降级：尝试 fetch_spot_data（非交易时段可能失败, 易被东财限频）
+                logger.warning("[GET 溢价] previous_em 为空，降级 fetch_spot_data")
+                spot_data = await service.fetch_spot_data()
+
+            # 匹配涨跌幅
+            premiums = []
+            for stock in limit_stocks:
+                stock_code = stock.get("code", "")
+                # 从实时行情中查找
+                change_percent = None
+                for spot in spot_data:
+                    if spot.get("code") == stock_code:
+                        change_percent = spot.get("change_percent")
+                        break
+                premiums.append({
+                    "stock_id": stock.get("stock_id"),
+                    "code": stock_code,
+                    "name": stock.get("name"),
+                    "change_percent": change_percent
+                })
+
+            return {
+                "premiums": premiums,
+                "limit_date": limit_date,
+                "snapshot_date": date,
+                "is_realtime": True
+            }
+        else:
+            # 从数据库读取快照
+            logger.info("从数据库读取溢价快照")
+            premiums = db.get_first_limit_premiums(limit_date, date)
+            return {
+                "premiums": premiums,
+                "limit_date": limit_date,
+                "snapshot_date": date,
+                "is_realtime": False
+            }
+
+    except Exception as e:
+        logger.error(f"获取首板溢价数据失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/first-limit-premiums/snapshot")
+async def save_first_limit_premiums_snapshot(
+    date: str = Body(..., description="快照日期，即溢价观察日"),
+    force: bool = Body(False, description="强制覆盖已有快照")
+):
+    """保存首板溢价快照
+
+    业务逻辑：
+    - 获取指定日期的上一个交易日的首板标的
+    - 通过 ak.stock_zt_pool_previous_em(date) 拉取【昨涨停今表现】接口，匹配这些标的的涨跌幅
+    - 存入 first_limit_premiums 表
+
+    注意：ak.stock_zh_a_spot_em() 全市场行情接口在当前环境已被东财封禁，
+    改用 stock_zt_pool_previous_em(date=今天) 拿"昨涨停今表现"专用接口。
+    该接口单次调用 0.2s，1 次即可覆盖 100% 昨日涨停标的（含昨日首板）。
+
+    Args:
+        date: 快照日期（格式：YYYY-MM-DD），即溢价观察日
+        force: 是否强制覆盖已有快照
+    """
+    import time
+    try:
+        logger.info(f"保存首板溢价快照，快照日期：{date}（force={force}）")
+
+        # 获取上一个交易日（首板日期）
+        limit_date = db.get_previous_trading_day(date)
+        if not limit_date:
+            logger.warning(f"无法获取 {date} 的上一个交易日，跳过快照保存")
+            return {"success": True, "message": "无上一交易日，跳过快照保存", "saved_count": 0}
+
+        logger.info(f"首板日期：{limit_date}，快照日期：{date}")
+
+        # 幂等保护：已有快照且不强制，跳过
+        if not force and db.has_first_limit_premiums(limit_date, date):
+            existing = db.get_first_limit_premiums(limit_date, date)
+            logger.info(f"快照已存在（{len(existing)} 条），跳过保存")
+            return {
+                "success": True,
+                "message": f"快照已存在（{len(existing)} 条），传 force=true 强制覆盖",
+                "saved_count": 0,
+                "skipped": True,
+                "limit_date": limit_date,
+                "premium_date": date
+            }
+
+        # 获取上一交易日的首板标的
+        limit_stocks = db.get_first_limits_by_date(limit_date, table="first_limits")
+        if not limit_stocks:
+            logger.info(f"上一交易日 {limit_date} 无首板标的，跳过快照保存")
+            return {"success": True, "message": "无首板标的，跳过快照保存", "saved_count": 0}
+
+        # === 拉取昨涨停今表现（专用接口，避免被东财限频） ===
+        # 接口语义：date=今天，返回昨天涨停的票在今天的涨跌幅
+        # 覆盖关系：previous_em ⊃ 昨天所有涨停票 ⊃ 昨天首板
+        date_compact = date.replace("-", "")
+        prev_em_df = None
+        last_err = None
+        for attempt in range(1, 3):  # 最多 2 次（首调 + 1 次重试）
+            try:
+                logger.info(f"ak.stock_zt_pool_previous_em({date_compact}) 第 {attempt} 次尝试")
+                prev_em_df = await asyncio.to_thread(
+                    ak.stock_zt_pool_previous_em, date=date_compact
+                )
+                break  # 成功
+            except Exception as e:
+                last_err = e
+                logger.warning(f"ak.stock_zt_pool_previous_em 第 {attempt} 次失败: {e}")
+                if attempt < 2:
+                    time.sleep(2)  # 限速 2s
+
+        if prev_em_df is None or len(prev_em_df) == 0:
+            logger.error(f"ak.stock_zt_pool_previous_em 全部重试失败: {last_err}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"东财昨涨停今表现接口不可用，已重试仍失败: {last_err}"
+            )
+
+        # 接口列名是中文：代码、名称、涨跌幅
+        # 构造 code -> change_percent 字典
+        import math as _math
+        change_pct_map = {}
+        for _, row in prev_em_df.iterrows():
+            try:
+                code = str(row.get("代码", "")).zfill(6)  # 补齐 6 位
+                pct_raw = row.get("涨跌幅")
+                if pct_raw is None:
+                    continue
+                # 兼容 NaN (float('nan'))
+                if isinstance(pct_raw, float) and _math.isnan(pct_raw):
+                    continue
+                change_pct_map[code] = float(pct_raw)
+            except Exception as e:
+                logger.debug(f"解析 previous_em 行失败: {e}, row={dict(row)}")
+                continue
+
+        logger.info(
+            f"ak.stock_zt_pool_previous_em 返回 {len(prev_em_df)} 条, "
+            f"有效 {len(change_pct_map)} 条"
+        )
+
+        # === 匹配涨跌幅并批量保存 ===
+        premiums_data = []
+        missing_codes = []
+        for stock in limit_stocks:
+            stock_id = stock.get("stock_id")
+            stock_code = str(stock.get("code", "")).zfill(6)
+            if not stock_id:
+                continue
+
+            change_percent = change_pct_map.get(stock_code)
+            if change_percent is None:
+                missing_codes.append(stock_code)
+                continue
+
+            premiums_data.append({
+                "stock_id": stock_id,
+                "limit_date": limit_date,
+                "premium_date": date,
+                "change_percent": change_percent,
+            })
+
+        saved_count = db.save_first_limit_premiums_batch(premiums_data) if premiums_data else 0
+
+        logger.info(
+            f"溢价快照保存完成：{saved_count}/{len(limit_stocks)} 条 "
+            f"（previous_em 缺失 {len(missing_codes)} 条: {missing_codes[:5]}{'...' if len(missing_codes) > 5 else ''}）"
+        )
+
+        return {
+            "success": True,
+            "message": f"保存 {saved_count}/{len(limit_stocks)} 条溢价快照"
+                       + (f"，{len(missing_codes)} 条未匹配（停牌/退市等）" if missing_codes else ""),
+            "saved_count": saved_count,
+            "expected_count": len(limit_stocks),
+            "missing_count": len(missing_codes),
+            "missing_codes": missing_codes[:20],  # 最多返前 20 个
+            "limit_date": limit_date,
+            "premium_date": date
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"保存首板溢价快照失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

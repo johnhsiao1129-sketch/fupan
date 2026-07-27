@@ -122,6 +122,38 @@ class DataAcquisitionService:
         """获取数据库连接"""
         return sqlite3.connect(self.db_path)
 
+    async def fetch_spot_data(self) -> List[Dict]:
+        """获取全市场实时行情数据
+
+        Returns:
+            包含 code, name, change_percent 等字段的字典列表
+        """
+        try:
+            import akshare as ak
+            import pandas as pd
+
+            df = ak.stock_zh_a_spot_em()
+            if df is None or len(df) == 0:
+                logger.warning("未获取到实时行情数据")
+                return []
+
+            df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce').fillna(0).astype(float)
+
+            results = []
+            for _, row in df.iterrows():
+                results.append({
+                    'code': str(row.get('代码', '')),
+                    'name': str(row.get('名称', '')),
+                    'change_percent': float(row.get('涨跌幅', 0)),
+                    'price': float(row.get('最新价', 0)),
+                    'amount': float(row.get('成交额', 0)),
+                })
+            logger.info(f"获取实时行情数据: {len(results)} 条")
+            return results
+        except Exception as e:
+            logger.error(f"获取实时行情数据失败: {e}", exc_info=True)
+            return []
+
     def _get_or_create_stock(self, stock_code: str, stock_name: str, industry: str = '', conn=None, cursor=None) -> int:
         """获取或创建股票记录
         
@@ -211,7 +243,9 @@ class DataAcquisitionService:
                 "continuous_limit_count": 0,
                 "exploded_count": 0,
                 "limit_down_count": 0,
-                "total_records": 0
+                "total_records": 0,
+                # 当日涨停池全量数据（code + change_pct），供溢价快照等下游使用
+                "limit_pool": []
             }
 
             # 根据use_tmp_table参数确定使用的表
@@ -244,6 +278,12 @@ class DataAcquisitionService:
                     logger.info(f"  DataFrame列名: {list(df_limit.columns)}")
                     logger.info(f"  前5行数据预览:\n{df_limit.head().to_string()}")
                     results["total_records"] += len(df_limit)
+                    # 收集所有涨停标的 code + 涨跌幅，供溢价快照等下游使用
+                    for _, _row in df_limit.iterrows():
+                        _code = str(_row.get('代码', ''))
+                        _change = float(_row.get('涨跌幅', 0)) if pd.notna(_row.get('涨跌幅')) else None
+                        if _code:
+                            results["limit_pool"].append({"code": _code, "change_percent": _change})
                 else:
                     logger.warning(f"⚠️ 返回空数据: {date}")
                     logger.warning(f"  可能原因：")
