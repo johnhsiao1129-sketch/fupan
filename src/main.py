@@ -90,7 +90,7 @@ async def startup_event():
         except Exception as e:
             logger.error(f"初始化人气榜数据源失败 {source_name}: {e}")
 
-    # 自动检测并刷新交易日历 (剩余 < 60 天时刷新)
+    # 自动检测并刷新交易日历 (DEBUG: 阈值临时改 1000, 启动必触发用于验证)
     try:
         conn = db._get_connection()
         cursor = conn.cursor()
@@ -102,18 +102,18 @@ async def startup_event():
             from datetime import datetime as _dt
             latest_date = _dt.strptime(latest_date_str, '%Y-%m-%d').date()
             days_until_expiry = (latest_date - _dt.now().date()).days
-            if days_until_expiry < 60:
-                logger.info(f"交易日历剩余 {days_until_expiry} 天, 自动刷新")
-                saved, _ = fetch_and_save_trading_days()
-                logger.info(f"自动刷新完成: 新增 {saved} 条")
+            if days_until_expiry < 1000:
+                logger.info(f"[STARTUP DEBUG] 交易日历剩余 {days_until_expiry} 天 (< 1000), 自动刷新")
+                saved, days_list = fetch_and_save_trading_days()
+                logger.info(f"[STARTUP DEBUG] 自动刷新完成: 新增 {saved} 条, 数据范围 {days_list[0] if days_list else 'N/A'} -> {days_list[-1] if days_list else 'N/A'}")
             else:
-                logger.info(f"交易日历充足 (剩余 {days_until_expiry} 天), 无需刷新")
+                logger.info(f"[STARTUP DEBUG] 交易日历充足 (剩余 {days_until_expiry} 天), 无需刷新")
         else:
-            logger.warning("trading_days 表为空, 自动刷新")
-            saved, _ = fetch_and_save_trading_days()
-            logger.info(f"自动刷新完成: 新增 {saved} 条")
+            logger.warning("[STARTUP DEBUG] trading_days 表为空, 自动刷新")
+            saved, days_list = fetch_and_save_trading_days()
+            logger.info(f"[STARTUP DEBUG] 自动刷新完成: 新增 {saved} 条, 数据范围 {days_list[0] if days_list else 'N/A'} -> {days_list[-1] if days_list else 'N/A'}")
     except Exception as e:
-        logger.error(f"自动检测交易日历失败: {e}", exc_info=True)
+        logger.error(f"[STARTUP DEBUG] 自动检测交易日历失败: {e}", exc_info=True)
 
     logger.info("服务启动完成")
 
@@ -3317,6 +3317,116 @@ async def init_trading_days():
     except Exception as e:
         logger.error(f"初始化交易日失败: {e}", exc_info=True)
         return {"success": False, "message": str(e)}
+
+
+@app.post("/api/trading-days/auto-refresh-debug")
+async def auto_refresh_trading_days_debug():
+    """DEBUG: 强制触发自动刷新 (绕过阈值), 返回完整链路 trace 用于 F12 console 验证
+
+    返回字段:
+    - trace: 各步骤耗时 + 数据量 (供前端 console.log 打印)
+    - latest_date_before / latest_date_after: 刷新前后数据库最新日期
+    - saved_count / skipped_count: 新增 / 跳过 (已存在)
+    - akshare_total / filtered_count: akshare 原始条数 / 筛选后条数
+    """
+    import time
+    try:
+        trace = []
+        t0 = time.time()
+
+        # 1. 刷新前数据库状态
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(date), COUNT(*) FROM trading_days')
+        row = cursor.fetchone()
+        latest_before = row[0]
+        total_before = row[1]
+        conn.close()
+
+        trace.append({
+            "step": "1_before",
+            "label": "刷新前 DB",
+            "latest_date": latest_before,
+            "total_count": total_before,
+            "elapsed_ms": round((time.time() - t0) * 1000, 1)
+        })
+
+        # 2. 调 fetch_and_save_trading_days (内部已包含 akshare + 筛选 + 入库)
+        t1 = time.time()
+        saved_count, trading_days = fetch_and_save_trading_days()
+        elapsed_akashe_ms = round((time.time() - t1) * 1000, 1)
+
+        trace.append({
+            "step": "2_fetch_and_save",
+            "label": "fetch_and_save_trading_days (akshare + 筛选 + INSERT OR IGNORE)",
+            "saved_count": saved_count,
+            "trading_days_count": len(trading_days),
+            "first_day": trading_days[0] if trading_days else None,
+            "last_day": trading_days[-1] if trading_days else None,
+            "elapsed_ms": elapsed_akashe_ms
+        })
+
+        # 3. 刷新后数据库状态
+        t2 = time.time()
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(date), COUNT(*) FROM trading_days')
+        row = cursor.fetchone()
+        latest_after = row[0]
+        total_after = row[1]
+        conn.close()
+
+        skipped_count = total_after - total_before  # 实际新增条数
+
+        trace.append({
+            "step": "3_after",
+            "label": "刷新后 DB",
+            "latest_date": latest_after,
+            "total_count": total_after,
+            "skipped_count": saved_count,  # INSERT OR IGNORE 跳过数 (rowcount=0)
+            "elapsed_ms": round((time.time() - t2) * 1000, 1)
+        })
+
+        # 4. 验证: 数据库里到底有多少 2027 年数据?
+        t3 = time.time()
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM trading_days WHERE date >= '2027-01-01'")
+        count_2027 = cursor.fetchone()[0]
+        cursor.execute("SELECT MIN(date), MAX(date) FROM trading_days")
+        min_date, max_date = cursor.fetchone()
+        conn.close()
+
+        trace.append({
+            "step": "4_verify",
+            "label": "DB 验证 (2027 数据 + 总范围)",
+            "count_2027": count_2027,
+            "min_date": min_date,
+            "max_date": max_date,
+            "elapsed_ms": round((time.time() - t3) * 1000, 1)
+        })
+
+        trace.append({
+            "step": "5_total",
+            "label": "总耗时",
+            "elapsed_ms": round((time.time() - t0) * 1000, 1)
+        })
+
+        return {
+            "success": True,
+            "message": f"DEBUG auto-refresh 触发完成, 新增 {saved_count} 条, 2027 数据 {count_2027} 条",
+            "trace": trace,
+            "summary": {
+                "saved_count": saved_count,
+                "latest_date_before": latest_before,
+                "latest_date_after": latest_after,
+                "count_2027": count_2027,
+                "akshare_total_filtered": len(trading_days)
+            }
+        }
+    except Exception as e:
+        logger.error(f"[DEBUG] auto-refresh 失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e), "trace": trace if 'trace' in locals() else []}
 
 
 @app.get("/api/trading-days/recent")

@@ -6192,6 +6192,27 @@
 
         // 初始化
         document.addEventListener('DOMContentLoaded', async function () {
+            // DEBUG: 触发交易日历自动刷新 (阈值 1000, 必触发) + 打印完整链路到 F12 console
+            try {
+                console.group('🚀 [DEBUG] trading_days 自动刷新触发链');
+                console.log('⏱️ 开始时间:', new Date().toISOString());
+                const resp = await fetch('/api/trading-days/auto-refresh-debug', { method: 'POST' });
+                const data = await resp.json();
+                if (data.success && data.trace) {
+                    data.trace.forEach((step, idx) => {
+                        console.log(`📍 Step ${idx + 1}: ${step.label}`, step);
+                    });
+                    console.log('📊 Summary:', data.summary);
+                    console.log('💬 Message:', data.message);
+                } else {
+                    console.error('❌ DEBUG 刷新失败:', data);
+                }
+                console.log('⏱️ 结束时间:', new Date().toISOString());
+                console.groupEnd();
+            } catch (err) {
+                console.error('❌ [DEBUG] auto-refresh 调用异常:', err);
+            }
+
             // 加载交易日列表
             await loadTradingDays();
             // 交易日列表加载完成后再加载主数据
