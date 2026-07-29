@@ -90,6 +90,31 @@ async def startup_event():
         except Exception as e:
             logger.error(f"初始化人气榜数据源失败 {source_name}: {e}")
 
+    # 自动检测并刷新交易日历 (剩余 < 60 天时刷新)
+    try:
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(date) FROM trading_days')
+        row = cursor.fetchone()
+        conn.close()
+        latest_date_str = row[0] if row else None
+        if latest_date_str:
+            from datetime import datetime as _dt
+            latest_date = _dt.strptime(latest_date_str, '%Y-%m-%d').date()
+            days_until_expiry = (latest_date - _dt.now().date()).days
+            if days_until_expiry < 60:
+                logger.info(f"交易日历剩余 {days_until_expiry} 天, 自动刷新")
+                saved, _ = fetch_and_save_trading_days()
+                logger.info(f"自动刷新完成: 新增 {saved} 条")
+            else:
+                logger.info(f"交易日历充足 (剩余 {days_until_expiry} 天), 无需刷新")
+        else:
+            logger.warning("trading_days 表为空, 自动刷新")
+            saved, _ = fetch_and_save_trading_days()
+            logger.info(f"自动刷新完成: 新增 {saved} 条")
+    except Exception as e:
+        logger.error(f"自动检测交易日历失败: {e}", exc_info=True)
+
     logger.info("服务启动完成")
 
 
