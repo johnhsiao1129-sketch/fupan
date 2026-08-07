@@ -282,7 +282,7 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_limits_date ON first_limits(limit_date)')
     
     # first_limit_topics 表索引
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limit_topics_limit ON first_limit_topics(first_limit_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limit_topics_limit ON first_limit_topics(stock_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_limit_topics_topic ON first_limit_topics(topic_id)')
     
     # limit_stats 表索引
@@ -679,10 +679,13 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_activations_tmp_date ON topic_activations_tmp(activation_date)')
 
     # ========== 修复 first_limits_tmp 表的 limit_type 默认值 ==========
-    cursor.execute("UPDATE first_limits_tmp SET limit_type = '10%' WHERE limit_type IS NULL")
-    updated_count = cursor.rowcount
-    if updated_count > 0:
-        print(f"✓ 已修复 first_limits_tmp 表的 limit_type 默认值: {updated_count} 条记录")
+    # 兼容性处理：仅当表存在 limit_type 列时才执行（旧版本遗留数据修复，新表无此列）
+    _tmp_cols = [row[1] for row in cursor.execute("PRAGMA table_info(first_limits_tmp)").fetchall()]
+    if 'limit_type' in _tmp_cols:
+        cursor.execute("UPDATE first_limits_tmp SET limit_type = '10%' WHERE limit_type IS NULL")
+        updated_count = cursor.rowcount
+        if updated_count > 0:
+            print(f"✓ 已修复 first_limits_tmp 表的 limit_type 默认值: {updated_count} 条记录")
 
     conn.commit()
     conn.close()
