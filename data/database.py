@@ -123,13 +123,16 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             stock_id INTEGER NOT NULL,
             limit_date TEXT NOT NULL,
-            limit_time TEXT,
+            first_limit_time TEXT,
+            final_limit_time TEXT,
             limit_price REAL,
             open_price REAL,
             amount REAL,
             reason TEXT,
             source TEXT,
             create_time TEXT NOT NULL,
+            limit_type TEXT DEFAULT '10%',
+            is_exploded INTEGER DEFAULT 0,
             UNIQUE(stock_id, limit_date),
             FOREIGN KEY (stock_id) REFERENCES stocks(stock_id) ON DELETE CASCADE
         )
@@ -635,6 +638,8 @@ def init_database():
             reason TEXT,
             source TEXT,
             create_time TEXT NOT NULL,
+            limit_type TEXT DEFAULT '10%',
+            is_exploded INTEGER DEFAULT 0,
             FOREIGN KEY (stock_id) REFERENCES stocks(stock_id) ON DELETE CASCADE
         )
     ''')
