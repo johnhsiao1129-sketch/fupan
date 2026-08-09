@@ -1071,10 +1071,10 @@ class RotationAnalysisDB:
                 # 插入到 first_limit_topics（记录首板-题材关联，create_time为操作时间，association_date为交易日）
                 cursor.execute('''
                     INSERT INTO first_limit_topics
-                    (stock_id, first_limit_id, topic_id, create_time, association_date)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (stock_id, first_limit_id, topic_id, datetime.now().isoformat(), association_date))
-                logger.info(f"插入first_limit_topics: stock_id={stock_id}, first_limit_id={first_limit_id}, topic_id={topic_id}, association_date={association_date}")
+                    (stock_id, topic_id, create_time, association_date)
+                    VALUES (?, ?, ?, ?)
+                ''', (stock_id, topic_id, datetime.now().isoformat(), association_date))
+                logger.info(f"插入first_limit_topics: stock_id={stock_id}, topic_id={topic_id}, association_date={association_date}")
 
             # 盘中关联：同时写入临时表
             from src.main import is_in_trading_hours
@@ -1106,9 +1106,9 @@ class RotationAnalysisDB:
             else:
                 cursor.execute('''
                     INSERT INTO topic_stock_relations
-                    (topic_id, stock_id, first_limit_id, date, relation_type, is_active, create_time)
-                    VALUES (?, ?, ?, ?, 'first_limit', 1, ?)
-                ''', (topic_id, stock_id, first_limit_id, association_date, datetime.now().isoformat()))
+                    (topic_id, stock_id, date, relation_type, is_active, create_time)
+                    VALUES (?, ?, ?, 'first_limit', 1, ?)
+                ''', (topic_id, stock_id, association_date, datetime.now().isoformat()))
                 logger.info(f"插入topic_stock_relations: stock_id={stock_id}, topic_id={topic_id}, date={association_date}")
 
             conn.commit()
@@ -1132,7 +1132,7 @@ class RotationAnalysisDB:
                     t.topic_name
                 FROM first_limit_topics flt
                 JOIN topics t ON flt.topic_id = t.topic_id
-                WHERE flt.first_limit_id = ?
+                WHERE flt.stock_id = (SELECT stock_id FROM first_limits WHERE id = ?)
                 ORDER BY t.topic_name
             ''', (first_limit_id,))
 
@@ -2013,7 +2013,7 @@ class RotationAnalysisDB:
                     fl.reason,
                     coalesce(fl.is_exploded, 0) as is_exploded
                 FROM {table} flt
-                JOIN {first_limits_table} fl ON flt.first_limit_id = fl.id
+                JOIN {first_limits_table} fl ON flt.stock_id = fl.stock_id AND fl.limit_date = flt.association_date
                 JOIN stocks s ON fl.stock_id = s.stock_id
                 WHERE flt.topic_id = ? AND flt.association_date = ?
                 ORDER BY fl.first_limit_time
@@ -2100,7 +2100,7 @@ class RotationAnalysisDB:
                 cursor.execute('''
                     SELECT COUNT(DISTINCT fl.id)
                     FROM first_limit_topics flt
-                    JOIN first_limits fl ON flt.first_limit_id = fl.id
+                    JOIN first_limits fl ON flt.stock_id = fl.stock_id AND fl.limit_date = flt.association_date
                     WHERE flt.topic_id = ? AND flt.association_date = ?
                 ''', (topic_id, date))
                 result = cursor.fetchone()
@@ -3762,16 +3762,13 @@ class RotationAnalysisDB:
                 limit_record = cursor.fetchone()
 
                 if limit_record:
-                    first_limit_id = limit_record[0]
-
-                    # 插入到题材关联表
+                    # 插入到题材关联表（first_limit_topics 已用 stock_id 关联，无需 first_limit_id）
                     cursor.execute(f'''
                         INSERT OR IGNORE INTO {topics_table}
-                        (stock_id, first_limit_id, topic_id, create_time, association_date)
-                        VALUES (?, ?, ?, ?, ?)
+                        (stock_id, topic_id, create_time, association_date)
+                        VALUES (?, ?, ?, ?)
                     ''', (
                         stock_id,
-                        first_limit_id,
                         topic_id,
                         datetime.now().isoformat(),
                         date

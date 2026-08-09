@@ -250,7 +250,6 @@ class DataAcquisitionService:
 
             # 根据use_tmp_table参数确定使用的表
             first_limits_table = "first_limits_tmp" if use_tmp_table else "first_limits"
-            first_limit_topics_table = "first_limit_topics_tmp" if use_tmp_table else "first_limit_topics"
             if use_tmp_table:
                 continuous_limits_table = None
             else:
@@ -609,44 +608,14 @@ class DataAcquisitionService:
 
             # 批量插入数据
             if to_save_first_limits:
-                # 在 INSERT OR REPLACE 之前，记录旧的 first_limit_id
-                stock_date_pairs = [(item[0], item[1]) for item in to_save_first_limits]
-                old_first_limit_ids = {}
-                for stock_id, limit_date in stock_date_pairs:
-                    cursor.execute(f'''
-                        SELECT id FROM {first_limits_table}
-                        WHERE stock_id = ? AND limit_date = ?
-                    ''', (stock_id, limit_date))
-                    result = cursor.fetchone()
-                    if result:
-                        old_first_limit_ids[(stock_id, limit_date)] = result[0]
-
                 # 执行 INSERT OR REPLACE（会删除旧记录并创建新ID）
+                # 注：first_limit_topics 已用 stock_id 关联（UNIQUE(stock_id, topic_id, association_date)），
+                # INSERT OR REPLACE 后 stock_id 不变，关联不失效，无需再同步 first_limit_id
                 cursor.executemany(f'''
                     INSERT OR REPLACE INTO {first_limits_table}
                     (stock_id, limit_date, first_limit_time, limit_price, amount, reason, is_exploded, source, create_time, limit_type)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'akshare', ?, ?)
                 ''', to_save_first_limits)
-
-                # 更新 first_limit_topics 表中的 first_limit_id 为新的ID
-                updated_count = 0
-                for (stock_id, limit_date), old_id in old_first_limit_ids.items():
-                    cursor.execute(f'''
-                        SELECT id FROM {first_limits_table}
-                        WHERE stock_id = ? AND limit_date = ?
-                    ''', (stock_id, limit_date))
-                    result = cursor.fetchone()
-                    if result and result[0] != old_id:
-                        new_id = result[0]
-                        cursor.execute(f'''
-                            UPDATE {first_limit_topics_table}
-                            SET first_limit_id = ?
-                            WHERE first_limit_id = ? AND association_date = ?
-                        ''', (new_id, old_id, limit_date))
-                        updated_count += cursor.rowcount
-
-                if updated_count > 0:
-                    logger.info(f"✓ 数据刷新后更新 first_limit_topics 表的 first_limit_id: {updated_count}条")
 
             if to_save_continuous_limits and continuous_limits_table:
                 cursor.executemany(f'''

@@ -181,6 +181,111 @@ def init_database():
         conn.commit()
         logger.info(f"恢复 first_limit_topics 旧数据完成")
     
+    # 7. 题材激活表
+    # 核心业务逻辑：
+    # - activation_date: 题材激活的交易日，决定今日首板板块展示哪些题材卡片
+    # - 盘中数据使用 topic_activations_tmp（临时表）；盘后/复盘使用本正式表
+    # - UNIQUE(topic_id, activation_date): 同一题材同一天只能激活一次
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS topic_activations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id INTEGER NOT NULL,
+            activation_date TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            UNIQUE(topic_id, activation_date),
+            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_activations_topic_date ON topic_activations(topic_id, activation_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_activations_date ON topic_activations(activation_date)')
+    
+    # 7.1 市场情绪相关表（market_mood_calculator + data_acquisition 使用）
+    # 注：这些表此前仅存在于生产 DB，git 从未记录建表（2026-08-09 从生产 DB 缺失恢复补回）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS topic_continuity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            topic_name TEXT NOT NULL,
+            topic_stage TEXT,
+            continuity_days INTEGER DEFAULT 0,
+            create_time TEXT
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_topic_continuity_date ON topic_continuity(trade_date)')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS limit_down_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            price REAL,
+            change_percent REAL,
+            continuous_days INTEGER DEFAULT 1,
+            sector TEXT,
+            reason TEXT,
+            amount REAL,
+            create_time TEXT
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limit_down_history_date ON limit_down_history(trade_date)')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS market_index (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            index_code TEXT,
+            index_name TEXT,
+            change_percent REAL,
+            close REAL
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_market_index_date ON market_index(trade_date)')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS market_mood_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL UNIQUE,
+            total_score REAL,
+            normalized_scores TEXT,
+            final_scores TEXT,
+            mood_level INTEGER,
+            mood_name TEXT,
+            indicator_details TEXT,
+            create_time TEXT
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_market_mood_history_date ON market_mood_history(trade_date)')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS market_mood_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT,
+            indicator_name TEXT,
+            indicator_code TEXT UNIQUE,
+            direction TEXT,
+            weight REAL DEFAULT 1,
+            baseline REAL,
+            calculation_rule TEXT,
+            is_enabled INTEGER DEFAULT 1,
+            update_time TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS market_mood_thresholds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mood_level INTEGER UNIQUE,
+            mood_name TEXT,
+            score_min INTEGER,
+            score_max INTEGER,
+            description TEXT,
+            color_code TEXT
+        )
+    ''')
+    
     # 7. 涨跌停统计表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS limit_stats (
