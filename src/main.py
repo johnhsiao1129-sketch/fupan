@@ -6,13 +6,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import asyncio
+import io
 import json
 import logging
 import os
 import random
 import sqlite3
 import struct
+import zipfile
 from datetime import datetime, timedelta, time
+from fastapi.responses import Response
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -2875,6 +2878,70 @@ async def get_dashboard_data(queryDate: str = None):
             "message": "获取数据失败",
             "timestamp": datetime.now().isoformat()
         }
+
+
+@app.get("/api/first-limits/export")
+async def export_first_limits(
+    date: str,
+    topics: Optional[str] = None,
+):
+    """导出首板数据为 zip 文件
+
+    文件：
+    - 全部首板.txt（所有当日首板，每行一个代码，UTF-8）
+    - <topic_name>.txt（每个选中题材，每行一个代码）
+
+    参数：
+    - date: YYYY-MM-DD（必填）
+    - topics: 逗号分隔的题材名（可选；不传=全部题材+全部首板）
+    """
+    try:
+        # 表选择逻辑（与 /api/dashboard 一致）
+        should_use_tmp = (date == get_query_trading_date() and is_in_trading_hours())
+        fl_table = "first_limits_tmp" if should_use_tmp else "first_limits"
+        act_table = "topic_activations_tmp" if should_use_tmp else "topic_activations"
+        flt_table = "first_limit_topics_tmp" if should_use_tmp else "first_limit_topics"
+
+        # 1. 全部首板
+        all_records = db.get_first_limits_by_date(date, table=fl_table)
+        all_codes = sorted({r['code'] for r in all_records})
+
+        # 2. 题材列表
+        activated_topics = db.get_activated_topics(date, table=act_table)
+
+        # 3. 题材过滤（None 表示全部）
+        selected = None
+        if topics:
+            selected = set(t.strip() for t in topics.split(',') if t.strip())
+
+        # 4. 打包 zip
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # 全部首板（始终包含）
+            zf.writestr("全部首板.txt", ("\n".join(all_codes) + "\n") if all_codes else "")
+
+            # 每个题材
+            for topic in activated_topics:
+                if selected is not None and topic['topic_name'] not in selected:
+                    continue
+                stocks = db.get_topic_first_limits_by_association_date(
+                    topic['topic_id'], date, table=flt_table
+                )
+                topic_codes = sorted({s['code'] for s in stocks})
+                filename = f"{topic['topic_name']}.txt"
+                zf.writestr(filename, ("\n".join(topic_codes) + "\n") if topic_codes else "")
+
+        buf.seek(0)
+        logger.info(f"导出首板 zip: date={date}, topics={topics or '全部'}, size={len(buf.getvalue())} bytes")
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="first_limits_{date}.zip"'},
+        )
+    except Exception as e:
+        logger.error(f"导出首板失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
+
 
 @app.get("/")
 async def dashboard(request: Request):
