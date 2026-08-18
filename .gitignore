@@ -68,6 +68,11 @@ data/*.docx
 backup/
 backup_*.html
 backup_*/
+backups/
+
+# 损坏备份快照 (一次性, 重 clone / 重建 venv 后无价值)
+.git_corrupt_*/
+venv_broken_*/
 
 # 历史脚本/设计文件 (一次性, 不应入 git)
 pencil*.pen
@@ -79,6 +84,7 @@ _to_delete/
 .mindscape/
 .omo/
 .anything-graph/
+.codegraph/
 .graph.db
 .graph.db-shm
 .graph.db-wal
