@@ -2186,6 +2186,26 @@ async def save_rotation_analysis(analysis: Dict = Body(...)):
         logger.error(f"保存题材轮动分析失败: {e}", exc_info=True)
         return {"success": False, "message": str(e)}
 
+
+@app.get("/api/stock-code-by-name")
+async def get_stock_code_by_name(name: str):
+    """通过股票名查代码（题材分析中点击 #xxx# 蓝色文字时用）"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            'SELECT stock_code FROM stocks WHERE stock_name = ? LIMIT 1',
+            (name,)
+        ).fetchone()
+        conn.close()
+        if row:
+            return {"success": True, "code": row['stock_code']}
+        return {"success": False, "message": f"未收录: {name}"}
+    except Exception as e:
+        logger.error(f"查询股票代码失败: {e}", exc_info=True)
+        return {"success": False, "message": str(e)}
+
+
 @app.get("/api/rotation-history")
 async def get_rotation_history(offset: int = 0):
     """加载题材轮动历史数据，从数据库读取最近5个交易日"""

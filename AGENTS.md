@@ -2,6 +2,8 @@
 
 This file contains conventions and commands for AI agents operating in this repository.
 
+> **项目概述**: A股复盘数据系统（FastAPI + SQLite + akshare），涵盖首板/炸板/跌停/强势股数据抓取、板块溢价分析（T+1开盘 vs T收盘）与趋势评分。
+
 ## Build, Lint, and Test Commands
 
 ```bash
@@ -174,3 +176,7 @@ python -c "from data.database import init_database; init_database()"
 
 ## Tech Stack
 FastAPI, SQLite, AkShare, Jinja2, Chart.js, async/await, pandas, numpy, aiohttp
+- [2026-10-09] AG 导入命中 node-file-path 去重时，去掉 file_path 再新增可规避被跳过
+- [2026-10-09] 图谱新增节点/边后补全子图实体与关联边，确保 webui 分区与关系完整
+- [2026-10-09] 前端微调按钮位置时，先精确 Read 定位目标行再 Edit，避免误改周边结构
+- [2026-10-09] .gitignore 须纳入临时/损坏备份目录，防止误推送大体积无用文件
