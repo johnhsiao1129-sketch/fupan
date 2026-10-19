@@ -45,134 +45,77 @@ python -c "from data.database import init_database; init_database()"
 ## Code Style Guidelines
 
 ### File Organization
-- `src/main.py`: FastAPI routes, service layer, trading date logic
-- `src/db_operations.py`: Database operations, topic/limit management
-- `src/data_acquisition.py`: Stock data fetching from AkShare API
-- `src/trend_analysis.py`: Trend stock analysis module (independent, 100-point scoring)
-- `data/database.py`: Database schema/migrations (run init_database() after changes)
-- `templates/dashboard.html`: Main frontend (HTML/CSS/JS in one file)
-- `static/`: Static JS/CSS assets
-- `config/`: JSON configuration files
-- Test files: root directory with `test_` prefix
+- `src/main.py`: FastAPI routes + 交易日逻辑; `src/db_operations.py`: DB/topic/limit 管理
+- `src/data_acquisition.py`: AkShare 采集; `src/trend_analysis.py`: 趋势评分（独立模块）
+- `data/database.py`: schema/migrations（改后必须 `init_database()`）
+- `templates/dashboard.html`: 前端一体文件; `config/`: JSON 配置; 测试 `test_*.py` 在根目录
 
 ### Imports, Formatting & Naming
-- Standard → third-party → local imports
-- Add `sys.path.append(os.path.dirname(os.path.abspath(__file__)))` at top of src/ files
-- Use `from module import specific_class` over `import module`
-- Example:
-  ```python
-  import asyncio
-  from typing import List, Dict, Optional
-  from fastapi import FastAPI
-  from db_operations import RotationAnalysisDB
-  ```
-- 4 spaces indentation (no tabs), 120 char max line length
-- Classes: PascalCase (`StockDataService`), Functions: snake_case (`get_limit_stats`)
-- Private: `_load_history_data`, Constants: UPPER_SNAKE_CASE (`DB_PATH`, `MAX_RETRIES`)
-- API endpoints: kebab-case (`/api/limit-stats`)
-- HTML IDs/classes: kebab-case (`topic-modal`, `delete-modal-btn`)
-- Type hints required: `def get_data(key: str) -> Optional[Dict]:`
+- Standard → third-party → local; `src/` 顶部加 `sys.path.append(os.path.dirname(os.path.abspath(__file__)))`
+- 4 空格缩进（禁 tab）, 120 char 行宽; 类 PascalCase / 函数 snake_case / 常量 UPPER_SNAKE_CASE
+- Type hints 必填; API endpoint kebab-case（`/api/limit-stats`）; HTML ID/class kebab-case
 
 ### Error Handling & Logging
-- Specific exceptions in try-except, log with `logger.error(f"msg: {e}", exc_info=True)`
-- Fallback methods: `_get_fallback_*`
-- API errors: return dicts with "error" key or use HTTPException
-- Get logger: `logger = logging.getLogger(__name__)`
-- Log levels: INFO, WARNING, ERROR
-- Use f-strings: `logger.info(f"成功获取: {len(data)}条")`
-- Never log sensitive info (API keys, passwords)
-- Use logging.debug() for detailed development information
+- 特定异常 + `logger.error(f"msg: {e}", exc_info=True)`; 回退方法 `_get_fallback_*`
+- API 错误返回含 `"error"` 键的 dict 或 HTTPException
+- 不记录敏感信息（API key/密码）; 详细调试用 `logging.debug()`
 
 ### Async/Await
-- Data fetching methods: `async def`, routes in main.py use async handlers
-- Always `await` async functions
-- Run async tests: `asyncio.run(test_function())`
+- 数据采集方法 `async def`, main.py 路由用 async handler, 一律 `await`
+- 异步测试 `asyncio.run(test_function())`
 
 ### Database Operations
-- SQLite at `data/fupan.db` with temp tables: `*_tmp` (trading), formal tables without suffix (final)
-- Always close connections (use context managers when possible)
-- Parameterized queries: `cursor.execute('SELECT * FROM t WHERE id = ?', (id,))`
-- **CRITICAL**: Check formal table data before auto-creating topics in post-market (protect user manual operations)
-- Trading: use temp tables, clear before each refresh, full replacement
-- Post-market: use formal tables, clear temp tables, auto-create only if no existing data
-- Use `INSERT OR REPLACE` with UNIQUE constraints → update dependent tables to prevent orphaned references
-- After schema changes in `database.py`, run: `python -c "from data.database import init_database; init_database()"`
-- **Dual-table queries**: When data may be in either formal or temp tables (user operations during trading):
-  - Query formal table first, then temp table as fallback
-- **Dual-table writes**: During trading hours, write to both formal and temp tables
+- SQLite `data/fupan.db` 双表: `*_tmp`（盘中）/ 无后缀正式表（盘后）
+- **CRITICAL**: 盘后自动建 topic 前必须先查正式表数据（保护用户手动操作）
+- 盘中用 tmp 表（刷新前清空, 全量替换）; 盘后用正式表, 清 tmp, 仅无数据时自动建
+- **Dual-table queries**: 数据可能在正式或 tmp 表 → 先查正式表, 无则查 tmp 兜底
+- **Dual-table writes**: 盘中写正式 + tmp 双份
+- 参数化查询 `cursor.execute('... WHERE id = ?', (id,))`; 用上下文管理器关闭连接
+- schema 改动后跑 `python -c "from data.database import init_database; init_database()"`
 
 ### Trading Session Logic
-- Trading hours: 9:25-15:00 on trading days (check with `is_in_trading_hours()`)
-- Trading → temp tables, auto-create topics always
-- Post-market/non-trading → formal tables, auto-create only if no existing data
-- `get_query_trading_date()`: for queries (first_limits, topic_activations, first_limit_topics associations)
-- `get_display_trade_date()`: for UI display (limit_stats, continuous_limits, market_summary)
+- 交易时段 9:25-15:00（`is_in_trading_hours()`）
+- 盘中 → tmp 表, 总是自动建 topic; 盘后/非交易日 → 正式表, 仅无数据时建
+- `get_query_trading_date()`: 查询用（first_limits / topic_activations / first_limit_topics 关联）
+- `get_display_trade_date()`: UI 显示用（limit_stats / continuous_limits / market_summary）
 
 ### Trend Stock Analysis (src/trend_analysis.py)
-- Independent module with 100-point scoring system
-- Categories: MA(25), Gain60d(20), MA20 Slope(15), Sector(10), Volume(10), Drawdown(10)
-- API rate limiting: 2-second delay between stock fetches, max 3 consecutive failures
-- Saves all scoring fields: ma_score, gain_60d_score, volume_score, recent_score, sector_score, drawdown_score
-- Data persistence: stock_daily_data table for K-line, trend_stocks table for scoring results
+- 独立模块 100 分制: MA(25) + Gain60d(20) + MA20斜率(15) + 板块(10) + 量能(10) + 回撤(10)
+- API 限流: 每只 2s 延迟, 连续失败 3 次终止
+- 落库全部评分字段（ma_score/gain_60d_score/volume_score/recent_score/sector_score/drawdown_score）; `stock_daily_data` 存 K线 + `trend_stocks` 存评分
 
 ### Frontend/JavaScript
-- camelCase variables/functions, PascalCase classes
-- Use const/let over var, minimize global scope
-- z-index > 9999 for dropdowns that need to float
-- Use innerHTML (not outerHTML) to preserve event bindings
-- Prefer getElementById over querySelector for performance
-- Remove console.log from production
-- Use event.preventDefault() and event.stopPropagation()
+- camelCase 变量/函数, PascalCase 类; const/let 优先, 缩小全局作用域
+- 浮动下拉 `z-index > 9999`
+- 用 innerHTML（非 outerHTML）保事件绑定; 生产删 console.log
+- 需要时 `event.preventDefault()` + `event.stopPropagation()`
 
 ### Configuration & HTML
-- Store configs in `config/` as JSON files (committed to git, not in .gitignore)
-- Backend provides GET/POST APIs for config CRUD (e.g., `/api/trend-filter-rules`)
-- Frontend loads from APIs, not localStorage
-- Ensure all `<div>` properly closed/nested
-- Modal tabs at same nesting level, content tabs: `style="display: none;"` by default
+- 配置存 `config/*.json`（入 git）; 后端 GET/POST API CRUD; 前端从 API 加载不用 localStorage
+- 所有 `<div>` 正确闭合/嵌套; Modal tab 同层级, 内容 tab 默认 `style="display: none;"`
 
 ### CSS Development (from .rules/frontend-development.md)
-- **CRITICAL**: Never define duplicate CSS class names - search before adding new styles
-- Ensure all style blocks have complete `{ ... }` pairs
-- Use descriptive class names with prefixes (e.g., `.topic-card-`, `.help-modal-`)
-- Check for broken CSS syntax before committing
+- **CRITICAL**: 不定义重复 CSS class — 加样式前先搜
+- 所有 style 块 `{ ... }` 配对完整; class 名带前缀（`.topic-card-`, `.help-modal-`）
+- 提交前查 CSS 语法
 
 ### File Cleanup Safety
-- **CRITICAL**: Before deleting/moving ANY file (including .env, .env.*, .json, .yaml, .toml), grep the codebase for references:
-  ```bash
-  # PowerShell
-  Select-String -Path "src\*.py", "*.py", "*.html" -Pattern "filename"
-  # Bash
-  grep -r "filename" src/ data/ *.py templates/
-  ```
-- **`.env.1` MUST be preserved** — this project intentionally uses `.env.1` filename to avoid Bun auto-loading (see `BUN_ENV_ISSUE.md`). Do NOT rename to `.env` or move to `_to_delete/`.
-  - Code references: `src/data_acquisition.py:21` (`load_dotenv('.env.1')`), `src/main.py:3999` (`env_file = '.env.1'`)
-  - Mairui License is loaded from `.env.1`; missing it silently skips 跌停/炸板/强势股 data fetching (no error thrown, just empty results)
-- All `.env*` files should be in `.gitignore` (currently: `.env`, `.env.1`, `.env.local`)
-- When cleaning up `*.py` scripts: confirm with `grep -r "import.*module_name"` that no other code imports it
-- Backup strategy: move candidates to `_to_delete/` first, test the app, then manually delete. Do NOT use `rm -rf` directly.
+- [2026-10-19] **CRITICAL**: 删/移任何文件前 grep 引用 — PowerShell `Select-String -Path "src\*.py","*.py","*.html" -Pattern "filename"` / bash `grep -r "filename" src/ data/ *.py templates/`
+- **`.env.1` MUST be preserved** — 避免 Bun auto-load（见 `BUN_ENV_ISSUE.md`）, 不改名/不移 `_to_delete/`; Mairui License 从它加载, 缺失则静默跳过 跌停/炸板/强势股（无报错, 结果为空）
+  - 引用: `src/data_acquisition.py:21`（`load_dotenv('.env.1')`）, `src/main.py:3999`（`env_file = '.env.1'`）; 所有 `.env*` 在 `.gitignore`
+- 清 `*.py` 前 `grep -r "import.*module_name"` 确认无引用
+- 删除先移 `_to_delete/` 观察并测过后手动删; 禁 `rm -rf`
 
 ### Backup Policy (自 2026-07-15 起)
-- **代码 / 配置 / 模板 / 前端 / 文档**: 全部走 `git` (commit + push 到 GitHub)
-  - 包括: `src/`、`templates/`、`static/`、`config/`、`data/database.py`、根目录脚本/配置、`.rules/`、AGENTS/README、`.gitignore`、`.env.example`
-- **运行时数据** (`data/fupan.db`): 由 `backup/backup_project.py` 镜像备份到 `D:\AI\my_programs\backup_YYYYMMDD_HHMMSS\`
-  - 数据库体积大 (~20MB) 不适合 git; 但内容是公开的 A 股数据, 镜像足够
-  - 备份频率建议: 每周一次 (数据库非高频变化)
-- **不入 git 的内容**:
-  - `backup/` 目录本身 (本地镜像)
-  - `_to_delete/` 目录 (废弃脚本观察区)
-  - `pencil*.pen` 设计文件 (临时草稿)
-  - `.mindscape/`、`.omo/`、`.anything-graph/`、`.opencodeignore*` (AI 内部状态)
-  - `data/cache/`、`data/*.json`、`data/*.xlsx`/`*.docx` (运行时缓存/用户文件)
-  - 所有 `.env*` (敏感凭据)
-- **`backup/backup_project.py`**: 留观察期, 暂不删。验证 git 备份足够后, 再决定是否彻底废弃。
+- **代码 / 配置 / 模板 / 前端 / 文档**: 全走 git（commit + push 到 GitHub）— `src/`、`templates/`、`static/`、`config/`、`data/database.py`、根目录脚本/配置、`.rules/`、AGENTS/README、`.gitignore`、`.env.example`
+- **运行时数据** (`data/fupan.db`): `backup/backup_project.py` 镜像到 `D:\AI\my_programs\backup_YYYYMMDD_HHMMSS\`（~20MB 不适合 git, 公开数据镜像足够, 建议每周一次）
+- **不入 git**: `backup/`、`_to_delete/`、`pencil*.pen`、`.mindscape/`、`.omo/`、`.anything-graph/`、`.opencodeignore*`、`data/cache/`、`data/*.json`、`data/*.xlsx`/`*.docx`、所有 `.env*`
+- `backup/backup_project.py` 留观察期暂不删, 验证 git 备份足够后再决定废弃
 
 ### Testing & Docstrings
-- Test files: `test_*.py` in root with descriptive names
-- Test both happy path and error scenarios
-- Tests can be run with pytest or directly (if script has async main)
-- Chinese for UI strings, English for code/comments
-- Keep comments concise, complex functions include Args/Returns
+- 测试文件根目录 `test_*.py`, 描述性命名; 同时测 happy path 和错误场景
+- 可 pytest 跑或直接跑（async main）
+- UI 字符串中文, 代码/注释英文; 注释简洁, 复杂函数含 Args/Returns
 
 ## Tech Stack
 FastAPI, SQLite, AkShare, Jinja2, Chart.js, async/await, pandas, numpy, aiohttp
@@ -180,3 +123,34 @@ FastAPI, SQLite, AkShare, Jinja2, Chart.js, async/await, pandas, numpy, aiohttp
 - [2026-10-09] 图谱新增节点/边后补全子图实体与关联边，确保 webui 分区与关系完整
 - [2026-10-09] 前端微调按钮位置时，先精确 Read 定位目标行再 Edit，避免误改周边结构
 - [2026-10-09] .gitignore 须纳入临时/损坏备份目录，防止误推送大体积无用文件
+
+<!-- OCM:START (scope=project) (do not edit this block manually) -->
+## ⚠️ 可用项目经验 (7 条 — 任务开始前必查)
+
+匹配当前任务的必须 `experience_get(id=<id>)` 读取完整内容再动手。不读 = 违反流程。
+
+- **重建 DB 后系统性比对代码引用表 vs 实际表** `id=c58bf217-c251-4895-bf56-9d1975aca137` (project / negative)
+  使用时机: 恢复 git 仓库后重建 DB / 排查 no such table / 任何 DB schema 恢复任务开始前。不读代价: 只修眼前报错, 漏掉一批同样缺失的表, 业务逐个炸。
+  关键词: no such table, database.py, init_database, schema
+- **first_limit_id→stock_id 迁移残留检查清单** `id=d5ca2670-9fd7-40ed-814a-0d33d8985db3` (project / negative)
+  使用时机: 遇到 "no such column: first_limit_id" 报错, 或修改任何引用 first_limit_topics / topic_stock_relations 的 SQL 之前。不读代价: 漏改残留引用, 盘后路径继续崩。
+  关键词: no such column: first_limit_id, first_limit_topics, topic_stock_relations
+- **git 的 database.py schema 可能与生产 DB 脱节, 恢复后必须对齐代码** `id=ea7df2bd-bc56-4045-82cc-398f9c45b773` (project / negative)
+  使用时机: 任何从 git 恢复/重建数据库后, 或遇到 "no such column" 报错时
+  关键词: no such column, init_database, 重建数据库, schema 不一致
+- **双表架构中查"历史日"必须用 first_limits 正式表,不能用 first_limits_tmp** `id=e8f9c81a-2e41-45e3-ace8-391212eacd99` (project / dev)
+  使用时机: 修改/添加任何"按历史日期查询 first_limits" 的代码路径 (查昨日票/查前几日票) 之前. 包括 get_first_limits_by_date 调用、快照保存路径、盘中 GET 端点盘中分支. 不读代价: 查询走 first_limits_tmp 默认表 → tmp 只有当日数据 → 返回 0 行 → 前端显示空 / 显示 -- / 落库静默失败.
+- **Minimal-Edit UI Refactor 模式** `id=2c36b0fd-30c2-491f-b14e-3fbdfe1921e9` (project / dev)
+  使用时机: 用户偏好: UI 改版时严格遵守"最小代码修改"——只改外观, 不重写已验证的逻辑函数. 切换控件样式时优先用 CSS class + 结构替换, 不动 onchange 处理器和函数体.
+- **盘后溢价值快照优先复用涨停池数据,避免调不稳定的实时行情API** `id=1d0d888a-e09e-42bd-8e8c-666a59b7108e` (project / dev)
+  使用时机: 在 fetch_and_save_limit_data 已走通后,又调 fetch_spot_data / stock_zh_a_spot_em 等全市场实时行情 API 来补充涨跌幅的场景
+不读代价: 非交易时段 stock_zh_a_spot_em 被服务器拒绝连接(RemoteDisconnected),快照保存静默失败(saved_count=0),用户无感知,前端永远拿不到数据
+强制: experience_get + before 任何「盘后保存额外数据需要全市场涨跌幅」的设计。优先复用已获取的 limit_pool 数据,stock_zh_a_spot_em 作为降级兜底
+- **溢价模式卡片重渲染必须用稳定的title选择器** `id=b76d9018-2b5c-4a52-af7d-4b5873938e14` (project / dev)
+  使用时机: <parameter name="description">触发: 实现 togglePremiumMode / renderTodayFirstLimits / 类似「切换模式后局部刷新卡片」的场景
+不读代价: 用 card.innerHTML.includes('🆕 今日首板') 等emoji+文字匹配时，标题会随模式切换变化（🆕 → 📈），第二次切换时匹配失败，DOM 不更新，用户看到「切换无反应」的假 bug
+强制: 重渲染函数必须用 querySelector('#firstLimitsTitle') 或 cardTitle 容器的 textContent.includes('今日首板|昨日溢价') 等稳定文本匹配，不要用包含 emoji 的整段 HTML 字符串
+
+<!-- OCM:END -->
+- [建议全局] [2026-10-19] textarea 换 div 后必须显式写 text-align: left，否则继承父级居中
+- [建议全局] [2026-10-19] AG ag_listSubgraphs 必须传 projectId UUID 而非项目名
