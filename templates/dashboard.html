@@ -12075,7 +12075,7 @@ function measureCategoryTagWidth(labels) {
 
 // 按行业分类分组渲染首板标的
 // level: 'l2'=申万二级行业, 'l1'=申万一级行业
-// 组间排序：[最早首板时间↑, 票数↓, 最晚首板时间↑, 行业名↑]
+// 组间排序：[票数↓, 最早首板时间↑, 最晚首板时间↑, 行业名↑]
 // 组内排序：[首板时间↑, 股票名称↑]（与扁平模式按名称排序保持一致）
 function renderGroupedStocks(stocks, level) {
     const useL1 = level === 'l1';
@@ -12101,8 +12101,8 @@ function renderGroupedStocks(stocks, level) {
     });
 
     groupList.sort((a, b) =>
-        a.minTime.localeCompare(b.minTime) ||
         b.count - a.count ||
+        a.minTime.localeCompare(b.minTime) ||
         a.maxTime.localeCompare(b.maxTime) ||
         a.sector.localeCompare(b.sector, 'zh')
     );
