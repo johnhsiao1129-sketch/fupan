@@ -1,4 +1,5 @@
 import sqlite3
+import json
 import logging
 import sqlite3
 from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
@@ -19,6 +20,34 @@ logger = logging.getLogger(__name__)
 # DB_PATH 用绝对路径, 避免被 CWD 影响
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = str(_PROJECT_ROOT / "data" / "fupan.db")
+
+# 申万二级行业 -> 申万一级行业 映射表（离线生成, 入 git; akshare 运行时不可用故用静态文件）
+_SW_INDUSTRY_MAP_PATH = _PROJECT_ROOT / "config" / "sw_industry_map.json"
+_sw_industry_map: Optional[Dict[str, str]] = None
+
+
+def get_sw_industry_map() -> Dict[str, str]:
+    """加载申万二级->一级行业映射表（进程内缓存，文件缺失时返回空字典）"""
+    global _sw_industry_map
+    if _sw_industry_map is None:
+        try:
+            if _SW_INDUSTRY_MAP_PATH.exists():
+                with open(_SW_INDUSTRY_MAP_PATH, 'r', encoding='utf-8') as f:
+                    _sw_industry_map = json.load(f).get('映射', {})
+            else:
+                logger.warning("申万行业映射表缺失: %s, 一级分类将退化为二级分类", _SW_INDUSTRY_MAP_PATH)
+                _sw_industry_map = {}
+        except Exception as e:
+            logger.error("加载申万行业映射表失败: %s", e, exc_info=True)
+            _sw_industry_map = {}
+    return _sw_industry_map
+
+
+def get_sector_l1(sector: str) -> str:
+    """把申万二级行业名映射为申万一级行业名；无映射时原样返回"""
+    if not sector:
+        return '综合'
+    return get_sw_industry_map().get(sector, sector)
 
 
 def is_trading_day(date_str: str) -> bool:
@@ -877,6 +906,7 @@ class RotationAnalysisDB:
                     'code': row[2],
                     'name': row[3],
                     'sector': row[4],  # 使用 industry 映射到 sector
+                    'sector_l1': get_sector_l1(row[4] or ''),  # 申万一级行业（用于一级分类显示）
                     'limit_date': row[5],
                     'first_time': row[6],
                     'final_time': row[7],

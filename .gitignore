@@ -85,6 +85,8 @@ _to_delete/
 .omo/
 .anything-graph/
 .codegraph/
+.experience-reviewer/
+AGENTS.md.bak.*
 .graph.db
 .graph.db-shm
 .graph.db-wal

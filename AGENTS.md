@@ -154,3 +154,13 @@ FastAPI, SQLite, AkShare, Jinja2, Chart.js, async/await, pandas, numpy, aiohttp
 <!-- OCM:END -->
 - [建议全局] [2026-10-19] textarea 换 div 后必须显式写 text-align: left，否则继承父级居中
 - [建议全局] [2026-10-19] AG ag_listSubgraphs 必须传 projectId UUID 而非项目名
+- [建议全局] [2026-10-28] Chrome contenteditable 按 Enter 插入块级 div 而非 br，保存时须补块边界换行
+- [2026-10-28] contenteditable 读取保留 display:none 需 clone 后手转 br，innerText 会吞隐藏文本
+- [建议全局] [2026-10-28] 高亮 span 加 contenteditable=false 可阻止光标进入，避免新输入继承样式
+- [建议全局] [2026-10-28] 拦截 Enter 改用 Selection API 插 br，execCommand insertHTML 在新版 Chrome 会静默失效
+- [建议全局] [2026-10-28] Chrome innerText 同时排除 display:none 和 visibility:hidden
+- [2026-10-28] textarea 改 contenteditable div 须显式补 overflow:auto 与 text-align:left
+- [2026-10-28] 标签统一宽度用canvas measureText精确测量文本，字符数估算会因字体差异导致宽度不齐
+- [2026-10-28] 首板sector字段实为申万二级行业且被数据源截断为4字，一级分类须靠静态映射表转换
+- [建议全局] [2026-10-28] 用Python脚本改文件时插入的新行必须显式带CRLF，否则会混入裸LF造成混合行尾
+- [建议全局] [2026-10-28] contenteditable区域按Enter插入块级div，单换行会被textContent吞掉，须keydown拦截强制插br

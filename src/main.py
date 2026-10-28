@@ -2124,6 +2124,7 @@ async def get_first_limits(date: str = None):
                     'change_percent': 10.0 if record['limit_type'] == '10%' else (20.0 if record['limit_type'] == '20%' else 30.0),
                     'first_time': record['first_time'] or '09:30',
                     'sector': record['sector'] or '综合',
+                    'sector_l1': record.get('sector_l1') or record['sector'] or '综合',
                     'reason': record['reason'],
                     'stock_id': record['stock_id'],
                     'id': record['id']
@@ -2822,6 +2823,7 @@ async def get_dashboard_data(queryDate: str = None):
                     'change_percent': 10.0 if record['limit_type'] == '10%' else (20.0 if record['limit_type'] == '20%' else 30.0),
                     'first_time': record['first_time'] or '09:30',
                     'sector': record['sector'] or '综合',
+                    'sector_l1': record.get('sector_l1') or record['sector'] or '综合',
                     'reason': record['reason'],
                     'stock_id': record['stock_id'],
                     'id': record['id']
