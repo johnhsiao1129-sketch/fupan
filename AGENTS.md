@@ -124,35 +124,11 @@ FastAPI, SQLite, AkShare, Jinja2, Chart.js, async/await, pandas, numpy, aiohttp
 - [2026-10-09] 前端微调按钮位置时，先精确 Read 定位目标行再 Edit，避免误改周边结构
 - [2026-10-09] .gitignore 须纳入临时/损坏备份目录，防止误推送大体积无用文件
 
-<!-- OCM:START (scope=project) (do not edit this block manually) -->
-## ⚠️ 可用项目经验 (7 条 — 任务开始前必查)
-
-匹配当前任务的必须 `experience_get(id=<id>)` 读取完整内容再动手。不读 = 违反流程。
-
-- **重建 DB 后系统性比对代码引用表 vs 实际表** `id=c58bf217-c251-4895-bf56-9d1975aca137` (project / negative)
-  使用时机: 恢复 git 仓库后重建 DB / 排查 no such table / 任何 DB schema 恢复任务开始前。不读代价: 只修眼前报错, 漏掉一批同样缺失的表, 业务逐个炸。
-  关键词: no such table, database.py, init_database, schema
-- **first_limit_id→stock_id 迁移残留检查清单** `id=d5ca2670-9fd7-40ed-814a-0d33d8985db3` (project / negative)
-  使用时机: 遇到 "no such column: first_limit_id" 报错, 或修改任何引用 first_limit_topics / topic_stock_relations 的 SQL 之前。不读代价: 漏改残留引用, 盘后路径继续崩。
-  关键词: no such column: first_limit_id, first_limit_topics, topic_stock_relations
-- **git 的 database.py schema 可能与生产 DB 脱节, 恢复后必须对齐代码** `id=ea7df2bd-bc56-4045-82cc-398f9c45b773` (project / negative)
-  使用时机: 任何从 git 恢复/重建数据库后, 或遇到 "no such column" 报错时
-  关键词: no such column, init_database, 重建数据库, schema 不一致
-- **双表架构中查"历史日"必须用 first_limits 正式表,不能用 first_limits_tmp** `id=e8f9c81a-2e41-45e3-ace8-391212eacd99` (project / dev)
-  使用时机: 修改/添加任何"按历史日期查询 first_limits" 的代码路径 (查昨日票/查前几日票) 之前. 包括 get_first_limits_by_date 调用、快照保存路径、盘中 GET 端点盘中分支. 不读代价: 查询走 first_limits_tmp 默认表 → tmp 只有当日数据 → 返回 0 行 → 前端显示空 / 显示 -- / 落库静默失败.
-- **Minimal-Edit UI Refactor 模式** `id=2c36b0fd-30c2-491f-b14e-3fbdfe1921e9` (project / dev)
-  使用时机: 用户偏好: UI 改版时严格遵守"最小代码修改"——只改外观, 不重写已验证的逻辑函数. 切换控件样式时优先用 CSS class + 结构替换, 不动 onchange 处理器和函数体.
-- **盘后溢价值快照优先复用涨停池数据,避免调不稳定的实时行情API** `id=1d0d888a-e09e-42bd-8e8c-666a59b7108e` (project / dev)
-  使用时机: 在 fetch_and_save_limit_data 已走通后,又调 fetch_spot_data / stock_zh_a_spot_em 等全市场实时行情 API 来补充涨跌幅的场景
-不读代价: 非交易时段 stock_zh_a_spot_em 被服务器拒绝连接(RemoteDisconnected),快照保存静默失败(saved_count=0),用户无感知,前端永远拿不到数据
-强制: experience_get + before 任何「盘后保存额外数据需要全市场涨跌幅」的设计。优先复用已获取的 limit_pool 数据,stock_zh_a_spot_em 作为降级兜底
-- **溢价模式卡片重渲染必须用稳定的title选择器** `id=b76d9018-2b5c-4a52-af7d-4b5873938e14` (project / dev)
-  使用时机: <parameter name="description">触发: 实现 togglePremiumMode / renderTodayFirstLimits / 类似「切换模式后局部刷新卡片」的场景
-不读代价: 用 card.innerHTML.includes('🆕 今日首板') 等emoji+文字匹配时，标题会随模式切换变化（🆕 → 📈），第二次切换时匹配失败，DOM 不更新，用户看到「切换无反应」的假 bug
-强制: 重渲染函数必须用 querySelector('#firstLimitsTitle') 或 cardTitle 容器的 textContent.includes('今日首板|昨日溢价') 等稳定文本匹配，不要用包含 emoji 的整段 HTML 字符串
-
-<!-- OCM:END -->
 - [2026-10-28] contenteditable 读取保留 display:none 需 clone 后手转 br，innerText 会吞隐藏文本
 - [2026-10-28] textarea 改 contenteditable div 须显式补 overflow:auto 与 text-align:left
 - [2026-10-28] 标签统一宽度用canvas measureText精确测量文本，字符数估算会因字体差异导致宽度不齐
 - [2026-10-28] 首板sector字段实为申万二级行业且被数据源截断为4字，一级分类须靠静态映射表转换
+- [2026-11-15] 改 UI 前先用真实浏览器截图看渲染结果，不靠读代码猜用户看到什么
+- [2026-11-15] 同一张图里重复两遍的绘制代码（初始绘制 + drawContent）必须同步改，否则出现样式闪烁不一致
+- [2026-11-15] 用户说「不展示/只显示X」时只改展示层，别动计算逻辑，也别顺手改配色
+- [2026-11-15] 改代码前先说明根因和改法，问清范围（配色/文字/算法是三件事）再动手
