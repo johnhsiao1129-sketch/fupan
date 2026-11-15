@@ -1173,11 +1173,18 @@ class MarketMoodCalculator:
     def _get_mood_by_score(self, cursor: sqlite3.Cursor, score: float) -> Dict:
         """
         根据总分确定情绪等级
-        
+
+        匹配规则（保证任何分数都唯一落档，不会掉进阈值表的缝隙）：
+        1) 精确区间匹配：score_min <= score <= score_max（score_max = -999 表示无上界）
+        2) 若 score 落在阈值表的缝隙里（如 25.79 落在 爆发[9,25] 与 高潮[26,∞) 之间），
+           先截掉小数部分取整数档再匹配：阈值表按整数档设计，截断后必然命中，
+           且 -20 / 26 仍是冰点、高潮的准确分界（与图表参考线一致）
+        3) 仍不命中时按阶梯兜底（命中 score_min <= score 的最高档）
+
         Args:
             cursor: 数据库游标
             score: 总分
-            
+
         Returns:
             情绪等级字典
         """
@@ -1187,31 +1194,64 @@ class MarketMoodCalculator:
                 FROM market_mood_thresholds
                 ORDER BY mood_level
             ''')
-            
+
             thresholds = cursor.fetchall()
-            
-            for row in thresholds:
-                mood_level = row[0]
-                mood_name = row[1]
-                score_min = row[2]
-                score_max = row[3]
-                
-                if score_min <= score and (score_max == -999 or score <= score_max):
-                    return {
-                        'mood_level': mood_level,
-                        'mood_name': mood_name,
-                        'score_min': score_min,
-                        'score_max': score_max
+
+            def _match(target: float) -> Optional[Dict]:
+                """按阈值表精确区间匹配"""
+                for row in thresholds:
+                    mood_level, mood_name, score_min, score_max = row
+                    if score_min <= target and (score_max == -999 or target <= score_max):
+                        return {
+                            'mood_level': mood_level,
+                            'mood_name': mood_name,
+                            'score_min': score_min,
+                            'score_max': score_max
+                        }
+                return None
+
+            mood = _match(score)
+
+            if mood is None:
+                # 分数落在阈值表缝隙里 → 截掉小数部分按整数档判定
+                int_score = int(score)  # 截断小数部分（向零取整）
+                mood = _match(int_score)
+                if mood is not None:
+                    logger.info(
+                        f"情绪分数 {score:.2f} 落在阈值区间缝隙，按整数档 {int_score} 判定为 {mood['mood_name']}"
+                    )
+
+            if mood is None:
+                # 阶梯兜底：命中 score_min <= score 的最高档
+                fallback = None
+                for row in thresholds:
+                    if row[2] <= score:
+                        fallback = row
+                    else:
+                        break
+                if fallback is not None:
+                    mood = {
+                        'mood_level': fallback[0],
+                        'mood_name': fallback[1],
+                        'score_min': fallback[2],
+                        'score_max': fallback[3]
                     }
-            
-            # 如果没有找到匹配的阈值，返回默认值
-            return {
-                'mood_level': 3,
-                'mood_name': '分化',
-                'score_min': -7,
-                'score_max': 8
-            }
-            
+                    logger.warning(
+                        f"情绪分数 {score:.2f} 无法精确匹配阈值表，按阶梯规则判定为 {mood['mood_name']}"
+                    )
+
+            if mood is None:
+                # 阈值表为空等异常情况：返回默认等级
+                logger.warning(f"情绪分数 {score:.2f} 无可用阈值，返回默认等级")
+                return {
+                    'mood_level': 3,
+                    'mood_name': '分化',
+                    'score_min': -7,
+                    'score_max': 8
+                }
+
+            return mood
+
         except Exception as e:
             logger.error(f"获取情绪等级失败: {e}", exc_info=True)
             return {
